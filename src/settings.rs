@@ -36,6 +36,11 @@ pub struct Settings {
     /// Folder -> dev server command the user approved in the webserver
     /// dialog (without port arguments), so later starts skip the question.
     pub approved_servers: BTreeMap<PathBuf, String>,
+    /// GitHub username -> Chrome profile folder its GitHub links open in.
+    pub chrome_profile_for_github: BTreeMap<String, String>,
+    /// GitHub usernames the user confirmed are signed in to GitHub in their
+    /// Chrome profile (Claude Deck can't see browser logins itself).
+    pub github_web_confirmed: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -64,6 +69,8 @@ impl Default for Settings {
             charge_codes_open: true,
             asana_panel_open: false,
             approved_servers: BTreeMap::new(),
+            chrome_profile_for_github: BTreeMap::new(),
+            github_web_confirmed: Vec::new(),
         }
     }
 }

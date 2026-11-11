@@ -4,6 +4,7 @@ mod assets;
 mod browser;
 mod catalog;
 mod charge_codes;
+mod chrome;
 mod git_identity;
 mod guard;
 mod glass;

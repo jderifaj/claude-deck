@@ -22,6 +22,7 @@ use crate::{
     asana::{self, Bucket},
     browser::{self, Browser, InstalledBrowser, SimDevice},
     charge_codes::{self, ChargeSection},
+    chrome,
     git_identity::{self, FolderLogins, GitIdentity},
     glass,
     catalog::{self, ThemeChoice},
@@ -284,6 +285,8 @@ pub struct Workbench {
     git_menu: Option<EntityId>,
     /// Whether the Device Hub button's device menu is open.
     device_menu: bool,
+    /// The branch badge's GitHub sign-in panel, while it's open.
+    github_sign_in: Option<GithubSignIn>,
     /// Simulators for the device menu; None while they load.
     sim_devices: Option<Vec<SimDevice>>,
     menu_closed_at: Option<Instant>,
@@ -456,6 +459,21 @@ fn paint_sparkle(bounds: gpui::Bounds<gpui::Pixels>, t: f32, window: &mut Window
         dot(window, p, 10., orange.opacity(0.018 * a)); // wide halo
         dot(window, p, 3., warm.opacity(0.15 * a)); // brighter line on the border
     }
+}
+
+/// Shown under a window's branch badge when its repo is private and its
+/// GitHub account hasn't been confirmed signed in to GitHub in Chrome, so the
+/// link would 404. Stays open (outside clicks don't close it) while the user
+/// signs in in Chrome.
+struct GithubSignIn {
+    session: EntityId,
+    user: String,
+    repo: String,
+    profiles: Vec<chrome::Profile>,
+    /// Profile folder picked; `None` means a new profile.
+    chosen: Option<String>,
+    /// GitHub's sign-in page was opened in the chosen profile.
+    opened: bool,
 }
 
 /// A window about to open, with what it needs from `git` already looked up.
@@ -639,6 +657,7 @@ impl Workbench {
             theme_menu: None,
             git_menu: None,
             device_menu: false,
+            github_sign_in: None,
             sim_devices: None,
             menu_closed_at: None,
             refresh_accounts_tx,
@@ -1031,6 +1050,102 @@ impl Workbench {
         self.sessions.push(session.clone());
         self.activate(&session, window, cx);
         session
+    }
+
+    /// The branch shown on a window's badge.
+    fn badge_branch(s: &TerminalSession) -> String {
+        match &s.workspace.isolation {
+            Some(iso) => iso.branch.clone(),
+            None => s.branch.clone().unwrap_or_else(|| "main".into()),
+        }
+    }
+
+    /// The branch badge was clicked: open the branch on GitHub. A public
+    /// repo just opens. A private one 404s unless the browser is signed in as
+    /// the window's GitHub account, so it opens in that account's Chrome
+    /// profile once the user has confirmed it's signed in there, and asks
+    /// them to sign in (`GithubSignIn`) before that.
+    fn open_branch_link(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let Some(session) = self.sessions.iter().find(|s| s.entity_id() == id).cloned() else { return };
+        let s = session.read(cx);
+        let Some(web) = self.folder_logins.get(&s.workspace.cwd).and_then(|l| l.web.clone()) else { return };
+        let (cwd, branch) = (s.workspace.cwd.clone(), Self::badge_branch(s));
+        let user = s.git.as_ref().map(|g| g.github_user.clone()).filter(|_| chrome::installed());
+        let profile = user.as_ref().and_then(|u| self.settings.chrome_profile_for_github.get(u).cloned());
+        let confirmed = user.as_ref().is_some_and(|u| self.settings.github_web_confirmed.contains(u) && profile.is_some());
+        let repo = web.rsplit('/').next().unwrap_or_default().to_string();
+        cx.spawn(async move |this, cx| {
+            let (url, public) = cx
+                .background_executor()
+                .spawn(async move { (git_identity::branch_web_url(&cwd, &web, Some(&branch)), chrome::is_public(&web)) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match (user, public) {
+                    // Confirmed signed in: its profile, public or not.
+                    (Some(_), _) if confirmed => this.open_in_profile(profile.unwrap_or_default(), url, cx),
+                    // Public, or no account to sign in as: the default
+                    // browser (or the account's profile, if it has one).
+                    (_, Some(true)) | (None, _) => match profile {
+                        Some(dir) => this.open_in_profile(dir, url, cx),
+                        None => cx.open_url(&url),
+                    },
+                    // Private (or GitHub unreachable): sign in first.
+                    (Some(user), _) => {
+                        this.close_menus(cx);
+                        this.github_sign_in = Some(GithubSignIn {
+                            session: id,
+                            user,
+                            repo,
+                            profiles: chrome::profiles(),
+                            chosen: profile,
+                            opened: false,
+                        });
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_in_profile(&mut self, dir: String, url: String, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let opened = cx.background_executor().spawn(async move { chrome::open(&dir, &url) }).await;
+            if let Err(e) = opened {
+                let _ = this.update(cx, |this, cx| this.notify(NoticeKind::Error, format!("Couldn't open GitHub in Chrome: {e}"), cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Sign-in panel, step 2: save the picked profile for the account and
+    /// open GitHub's sign-in page in it.
+    fn open_github_sign_in(&mut self, cx: &mut Context<Self>) {
+        let taken: Vec<String> = self.settings.chrome_profile_for_github.values().cloned().collect();
+        let Some(panel) = self.github_sign_in.as_mut() else { return };
+        let dir = panel.chosen.clone().unwrap_or_else(|| {
+            let taken: Vec<&str> = taken.iter().map(String::as_str).collect();
+            chrome::new_profile_dir(&panel.profiles, &taken)
+        });
+        panel.chosen = Some(dir.clone());
+        panel.opened = true;
+        let user = panel.user.clone();
+        self.settings.github_web_confirmed.retain(|u| u != &user);
+        self.settings.chrome_profile_for_github.insert(user, dir.clone());
+        self.settings.save();
+        self.open_in_profile(dir, chrome::SIGN_IN_URL.to_string(), cx);
+        cx.notify();
+    }
+
+    /// Sign-in panel, step 3: the user says Chrome is signed in as the
+    /// account; remember that and open the branch.
+    fn confirm_github_sign_in(&mut self, cx: &mut Context<Self>) {
+        let Some(panel) = self.github_sign_in.take() else { return };
+        if !self.settings.github_web_confirmed.contains(&panel.user) {
+            self.settings.github_web_confirmed.push(panel.user);
+            self.settings.save();
+        }
+        self.open_branch_link(panel.session, cx);
     }
 
     /// `claude-deck --smoke DIR`: drive the real account-switch path and
@@ -1488,6 +1603,11 @@ impl Workbench {
     }
 
     fn notify(&mut self, kind: NoticeKind, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.notify_for(kind, message, NOTICE_TIME, cx);
+    }
+
+    /// A notice that stays up for `stay` (for ones with more to read).
+    fn notify_for(&mut self, kind: NoticeKind, message: impl Into<SharedString>, stay: Duration, cx: &mut Context<Self>) {
         // Don't cover the welcome screen while it is still animating in.
         let hold = if self.sessions.is_empty() {
             (self.opened_at + WELCOME_ANIMATION_DONE).saturating_duration_since(Instant::now())
@@ -1495,7 +1615,7 @@ impl Workbench {
             Duration::ZERO
         };
         self.notice = Some(Notice { kind, message: message.into(), shows_at: Instant::now() + hold });
-        self.dismiss_notice_after(hold, NOTICE_TIME, cx);
+        self.dismiss_notice_after(hold, stay, cx);
         cx.notify();
     }
 
@@ -2427,6 +2547,146 @@ impl Workbench {
             })
     }
 
+    /// Private repo, GitHub account not confirmed signed in yet: walk the
+    /// user through signing in before anything is sent to GitHub.
+    fn render_github_sign_in(&self, panel: &GithubSignIn, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let GithubSignIn { user, repo, profiles, chosen, opened, .. } = panel;
+        let opened = *opened;
+        let hover = t.list_hover_bg;
+        let used_by = |dir: &str| {
+            self.settings.chrome_profile_for_github.iter().find(|(u, d)| d.as_str() == dir && *u != user).map(|(u, _)| u.clone())
+        };
+        let step = |n: &str, text: String| {
+            div()
+                .px(px(12.))
+                .pt(px(10.))
+                .pb(px(4.))
+                .flex()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(div().flex_none().text_color(t.fg_muted).child(n.to_string()))
+                .child(div().flex_1().min_w(px(0.)).child(text))
+        };
+        let note = |text: String| div().px(px(12.)).pt(px(4.)).text_size(px(12.)).text_color(t.fg_muted).child(text);
+        let button = |eid: &'static str, label: String, primary: bool, enabled: bool| {
+            let hover_bg = if primary { t.button_hover_bg } else { hover };
+            div()
+                .id(eid)
+                .mx(px(12.))
+                .mt(px(4.))
+                .h(px(26.))
+                .px(px(10.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(3.))
+                .text_size(px(12.))
+                .when(primary, |d| d.bg(t.button_bg).text_color(t.button_fg))
+                .when(!primary, |d| d.border_1().border_color(t.border))
+                .when(!enabled, |d| d.opacity(0.4))
+                .when(enabled, |d| d.cursor_pointer().hover(move |s| s.bg(hover_bg)))
+                .child(label)
+        };
+        let mut menu = div()
+            .id("github-sign-in")
+            .occlude()
+            .w(px(360.))
+            .py(px(8.))
+            .rounded(px(6.))
+            .bg(t.notification_bg)
+            .border_1()
+            .border_color(t.border)
+            .shadow_lg()
+            .text_color(t.fg)
+            // Clicks inside don't reach the pane header.
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(icon("github", 14., t.fg))
+                    .child(div().flex_1().min_w(px(0.)).font_weight(gpui::FontWeight::BOLD).child(format!("Sign in to GitHub as {user}")))
+                    .child(
+                        div()
+                            .id("github-sign-in-close")
+                            .flex_none()
+                            .p(px(2.))
+                            .rounded(px(3.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .child(icon("close", 12., t.fg_muted))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.github_sign_in = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(note(format!(
+                "{repo} is private, so GitHub shows a 404 unless the browser is signed in as {user}. \
+                 Claude Deck can't see your browser's login, so set it up once:"
+            )))
+            .child(step("1", format!("Chrome profile for {user}")));
+        let options = profiles
+            .iter()
+            .map(|p| (Some(p.dir.clone()), p.name.clone(), if p.email.is_empty() { "Chrome profile".to_string() } else { p.email.clone() }))
+            .chain(std::iter::once((None, "New Chrome profile".to_string(), format!("Recommended: a separate profile only for {user}"))));
+        for (i, (dir, title, detail)) in options.enumerate() {
+            let selected = *chosen == dir;
+            let new = dir.is_none();
+            let taken = dir.as_deref().and_then(used_by);
+            let detail = match &taken {
+                Some(other) => format!("{detail} · used for {other}"),
+                None => detail,
+            };
+            menu = menu.child(
+                div()
+                    .id(("github-profile", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .py(px(4.))
+                    .when(selected, |d| d.bg(t.list_active_bg))
+                    .when(taken.is_some(), |d| d.opacity(0.4))
+                    .when(taken.is_none(), |d| {
+                        d.cursor_pointer().hover(move |st| st.bg(hover)).on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(panel) = this.github_sign_in.as_mut() {
+                                panel.chosen = dir.clone();
+                                panel.opened = false;
+                            }
+                            cx.notify();
+                        }))
+                    })
+                    .child(icon(if new { "plus" } else { "globe" }, 16., t.fg))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().truncate().child(title))
+                            .child(div().text_size(px(12.)).text_color(t.fg_muted).child(detail)),
+                    )
+                    .when(selected, |d| d.child(icon("check", 14., t.focus_border))),
+            );
+        }
+        let confirm = button("github-confirm-sign-in", format!("I'm signed in as {user}, open the branch"), opened, opened);
+        menu.child(step("2", format!("Sign in as {user} in that profile")))
+            .child(
+                button("github-open-sign-in", "Open GitHub sign-in in Chrome".into(), !opened, true)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_github_sign_in(cx))),
+            )
+            .child(note(format!(
+                "If GitHub shows a dashboard instead of a sign-in form, that profile is already signed in, maybe as \
+                 someone else: check the avatar menu, and use Add account to sign in as {user}."
+            )))
+            .child(step("3", format!("Back here once you're signed in as {user}")))
+            .child(confirm.when(opened, |b| b.on_click(cx.listener(|this, _, _, cx| this.confirm_github_sign_in(cx)))))
+    }
+
     fn render_git_menu(&self, session: &Entity<TerminalSession>, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let id = session.entity_id();
         let s = session.read(cx);
@@ -2854,14 +3114,11 @@ impl Workbench {
         let s = session.read(cx);
         let active = self.active == Some(id);
         let hover = t.list_hover_bg;
-        let badge = match &s.workspace.isolation {
-            Some(iso) => iso.branch.clone(),
-            None => s.branch.clone().unwrap_or_else(|| "main".into()),
-        };
+        let badge = Self::badge_branch(s);
         let (sid, label) = (s.id, s.label());
         // With a GitHub `origin`, the badge links to the branch on github.com.
-        let web = self.folder_logins.get(&s.workspace.cwd).and_then(|l| l.web.clone());
-        let (cwd, branch) = (s.workspace.cwd.clone(), badge.clone());
+        let linked = self.folder_logins.get(&s.workspace.cwd).is_some_and(|l| l.web.is_some());
+        let picker = self.github_sign_in.as_ref().filter(|p| p.session == id).map(|p| self.render_github_sign_in(p, t, cx));
         let chip = self.render_account_chip(session, t, cx);
         let theme_button = self.render_theme_button(session, t, cx);
         let git_chip = self.render_git_chip(session, t, cx);
@@ -2883,35 +3140,41 @@ impl Workbench {
             .child(div().truncate().child(label))
             .child(
                 div()
-                    .id(("pane-branch", sid))
+                    .relative()
                     .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(3.))
-                    .px(px(6.))
-                    .h(px(16.))
-                    .rounded(px(8.))
-                    .bg(t.badge_bg.opacity(0.5))
-                    .text_size(px(11.))
-                    .child(icon("branch", 10., t.badge_fg))
-                    .child(badge)
-                    .when_some(web, |d, web| {
-                        let hover = t.badge_bg;
-                        d.cursor_pointer()
-                            .hover(move |st| st.bg(hover))
-                            .child(icon("external", 9., t.badge_fg))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.stop_propagation();
-                                let (cwd, web, branch) = (cwd.clone(), web.clone(), branch.clone());
-                                cx.spawn(async move |_, cx| {
-                                    let url = cx
-                                        .background_executor()
-                                        .spawn(async move { git_identity::branch_web_url(&cwd, &web, Some(&branch)) })
-                                        .await;
-                                    let _ = cx.update(|cx| cx.open_url(&url));
-                                })
-                                .detach();
-                            }))
+                    .child(
+                        div()
+                            .id(("pane-branch", sid))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap(px(3.))
+                            .px(px(6.))
+                            .h(px(16.))
+                            .rounded(px(8.))
+                            .bg(t.badge_bg.opacity(0.5))
+                            .text_size(px(11.))
+                            .child(icon("branch", 10., t.badge_fg))
+                            .child(badge)
+                            .when(linked, |d| {
+                                let hover = t.badge_bg;
+                                d.cursor_pointer()
+                                    .hover(move |st| st.bg(hover))
+                                    .child(icon("external", 9., t.badge_fg))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_branch_link(id, cx);
+                                    }))
+                            }),
+                    )
+                    .when_some(picker, |d, picker| {
+                        d.child(deferred(
+                            anchored()
+                                .position_mode(AnchoredPositionMode::Local)
+                                .position(point(px(0.), px(20.)))
+                                .snap_to_window_with_margin(px(8.))
+                                .child(picker),
+                        ))
                     }),
             )
             .child(div().flex_1())
