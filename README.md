@@ -28,6 +28,31 @@ in one window.
 Built with Rust, GPUI, `alacritty_terminal` and `portable-pty`. Runs on macOS and needs the
 Claude Code CLI (`claude`) installed and signed in.
 
+## Design decisions
+
+  ### Rust and GPUI
+
+  Electron would have melted the CPU once you spin up eight or ten terminal instances
+  streaming live text and UI—web views just start dragging. GPUI gives us GPU-accelerated
+  rendering in Rust: near-zero latency, minimal RAM overhead, and no garbage collector
+  stuttering while everything runs full throttle.
+
+  ### Git worktrees
+
+  A dedicated worktree per session prevents the agents from stepping on each other. If
+  multiple Claude sessions touch the same local folder at once, you get instant state chaos
+  with lock conflicts, half-baked commits, and messy git statuses. Giving each session its
+  own worktree lets them work on isolated branches simultaneously while sharing one repo
+  root.
+
+  ### Sandboxed execution
+
+  Sandboxing is pure self-preservation. You are giving autonomous agents real shell execution
+  privileges; isolating each session keeps credentials contained, blocks accidental
+  system-level damage, and lets you run different client accounts without leaking environment
+  variables across instances.
+
+
 ## Getting started
 ```sh
 ./scripts/bundle.sh                 # builds dist/Claude Deck.app
