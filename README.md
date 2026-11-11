@@ -1,7 +1,34 @@
 # Claude Deck
 
-A VS Code-style desktop app (Rust + [GPUI](https://gpui.rs)) for running many Claude Code sessions side by side.
+A high-performance, VS Code-style desktop workspace built with Rust and [GPUI](https://gpui.rs) for running,
+organizing and monitoring multiple Claude Code sessions side by side.
 
+Designed for developers juggling multiple repositories, accounts and client projects, Claude Deck brings an
+AI-assisted workflow into a single native interface: session management, live plan usage and developer tools
+in one window.
+
+## Core features
+- **Multi-session management:** run and view several Claude Code sessions at once, in a grid or as tabs, in a
+  fast native GPUI workspace. Each extra session in a repo gets its own git worktree, so sessions never edit
+  the same files.
+- **Account and repo mapping:** give each window its own Claude account, switch accounts mid-conversation, and
+  link a GitHub identity to an account or a folder so commits and pushes go out as the right person. Reopen
+  recent projects in one click.
+- **Integrated developer tools:** start a project's local dev server (Astro, Next.js, Vite, Hugo, Jekyll,
+  static HTML and more) on a free port, open its page in Chrome, Safari or Firefox, and test it on iPhone and
+  iPad simulators when Xcode is installed.
+- **Side panel:** keep your charge codes at hand for time tracking, and see your open Asana tasks grouped by
+  due date (optional; your Asana token is stored in the macOS Keychain).
+- **Flexible theming:** use any VS Code theme for the whole app, or give a single window its own theme to tell
+  sessions apart.
+- **Live usage monitoring:** see each signed-in account's 5-hour and 7-day plan usage with reset countdowns.
+- **Safety gates:** sessions that work on Claude Deck itself run in Claude Code's OS sandbox, with deny rules
+  for secrets and system files that project settings can't loosen.
+
+Built with Rust, GPUI, `alacritty_terminal` and `portable-pty`. Runs on macOS and needs the
+Claude Code CLI (`claude`) installed and signed in.
+
+## Getting started
 ```sh
 ./scripts/bundle.sh                 # builds dist/Claude Deck.app
 cargo run --release -- ~/Sites/proj # or run directly, opening sessions for folders
