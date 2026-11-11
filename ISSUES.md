@@ -139,3 +139,99 @@ in the background. The smoke test still blocks on `git`. The `.git/config`-direc
 
 **To confirm if it happens again:** run `sample <pid> 5` (or Activity Monitor → Sample Process) during the
 hang and look for `git_identity::git` or `waitpid` on the main thread.
+
+## Server panel shows one port and ignores a project's Docker Compose services
+
+**Seen:** 2026-11-06, in a session for `~/Sites/email-app`.
+
+**What happened:** The project runs three containers with `docker compose up -d`, each published on
+`127.0.0.1` only. Pressing the activity bar's webserver button didn't find any of them. Instead it started
+Claude Deck's built-in static server for the folder on `:8080`, without asking, and the panel showed only that.
+
+```
+$ docker ps --filter label=com.docker.compose.project.working_dir=/Users/me/Sites/email-app \
+    --format '{{.Label "com.docker.compose.service"}}\t{{.Ports}}'
+app      127.0.0.1:4321->4321/tcp                          # Astro dashboard
+assets   127.0.0.1:8081->80/tcp                            # nginx, email images
+mailpit  127.0.0.1:1025->1025/tcp, 127.0.0.1:8025->8025/tcp  # SMTP + inbox UI
+
+$ lsof -nP -iTCP:8080 -sTCP:LISTEN
+claude-de  69066  TCP 127.0.0.1:8080 (LISTEN)              # the static server the button started
+```
+
+The project layout that triggers it: `docker-compose.yml` at the root, the Node app in `app/` (its own
+`package.json` with a `dev` script), and generated `.html` files in `out/`, but no `package.json` or
+`index.html` at the root.
+
+**Why Claude Deck gets this wrong:**
+
+1. `ServerFound::look` (`src/workbench.rs`) first asks `browser::find_local_page`. That function only matches
+   listeners started by the session or whose cwd is inside the folder. Docker-published ports belong to
+   `com.docker.backend`, so they never match. This is point 3 of "Browser button can open another project's
+   server on the same port" above.
+2. `webserver::detect` only reads `package.json` at the folder root. With none there, `static_root` finds HTML
+   in `out/`, so the project is treated as `Framework::Static` on its default `8080`. Static projects skip the
+   approval dialog (`ask = !project.is_static() && …`), so the server starts straight away.
+3. `ServerRun` holds a single `port` and `url`, and `render_server_panel` draws a single chip and link. Even
+   with detection fixed, a project with several services could only show one of them.
+
+**Proposed change:**
+
+1. **Find the folder's Compose services** (new function in `src/webserver.rs`, beside `docker_ports`):
+   - Run `docker ps --filter label=com.docker.compose.project.working_dir=<session folder> --format
+     '{{.Label "com.docker.compose.service"}}\t{{.Ports}}'` through `output_within`, with the same short timeout
+     as `docker_ports`. Use the canonical (symlink-resolved) folder path, since Compose records it that way.
+   - Parse each published mapping into `{ service, host_ip, host_port, container_port }`. Reuse the
+     `parse_docker_ports` logic, keeping the host address instead of dropping it. Skip unpublished ports
+     (`5432/tcp` with no `->`), and list a port bound on both `0.0.0.0` and `[::]` once.
+   - Docker missing, not running or slow should give an empty list, never an error notice.
+
+2. **Tell web ports from the rest:** for each published port, send `HEAD / HTTP/1.0` with a ~300 ms timeout, in
+   the background like the rest of `look`. A reply starting `HTTP/` makes it a web page. Anything else (such as
+   Mailpit's SMTP banner `220 …` on 1025) is listed without a link.
+
+3. **Use them in `ServerFound::look`**, after the existing session/cwd check and before `detect`:
+   - Add a variant, for example `ServerFound::Compose { services: Vec<ComposePort>, primary: Option<String> }`.
+   - Primary URL (what the panel's Open link and the browser buttons use): the lowest-numbered web port. Build
+     it from the bound address: `http://127.0.0.1:<port>` for `127.0.0.1` or wildcard binds, so a `[::1]`
+     listener from another project can't capture `localhost` (see the first issue above).
+   - Treat it like a found server: `external = true`, phase `Ready`, no Stop button, and never start the static
+     server.
+
+4. **Show every service in the panel** (`render_server_panel`):
+   - Title: "Docker Compose is running" (or "N services running in Docker Compose").
+   - One row per published port: service name, `:port`, and a link when it's a web port, for example
+     `app · :4321 ↗`, `assets · :8081 ↗`, `mailpit · :8025 ↗`, `mailpit · :1025 (not a web page)`.
+     The primary row gets the existing orange chip.
+   - Keep `ServerRun.port` and `url` for the primary so the browser buttons keep working, and add a
+     `services: Vec<ComposePort>` field for the list.
+
+5. **Make the browser buttons find it too:** have `find_local_page` fall back to the same Compose lookup and
+   primary-URL rule when `find_server_port` returns `None`. That closes point 3 of the first issue.
+
+6. **Don't serve a Compose project as static HTML:** if the folder has `compose.yaml`, `compose.yml`,
+   `docker-compose.yaml` or `docker-compose.yml` but no service is running, don't fall back to
+   `Framework::Static`. Show `ServerFound::Nothing` with "This folder runs with Docker Compose. Start it with
+   `docker compose up -d`, then press the button again."
+
+**Acceptance:**
+
+- With the email-app stack running, the button opens the panel with four rows (app 4321, assets 8081,
+  mailpit 8025, mailpit 1025). The first three link to `http://127.0.0.1:<port>`, and 1025 has no link.
+  Nothing listens on 8080 afterwards.
+- The Chrome, Safari and Firefox buttons open `http://127.0.0.1:4321` for that session.
+- With the stack stopped, the button shows the "runs with Docker Compose" message and starts nothing.
+- Projects without a Compose file behave as today (Astro in the folder root, plain static HTML, Hugo, Jekyll).
+- Two Compose projects open in different sessions each list only their own containers.
+- Unit tests next to `parses_docker_ports_and_strips_ansi`:
+  - Parse the three-line output above, including the two-mapping `mailpit` line.
+  - Collapse `0.0.0.0` and `[::]` duplicates.
+  - Skip unpublished ports.
+  - Classify `HTTP/1.1 200` as web and `220 mailpit ESMTP` as not.
+
+**Out of scope for now:**
+
+- Starting or stopping Compose from the panel (`docker compose up -d` / `down`). The approval dialog could
+  offer it later.
+- Detecting a `package.json` in a subfolder (like `app/`) for projects that run without Docker.
+- Containers started with plain `docker run`, which have no Compose working-dir label.
