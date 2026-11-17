@@ -470,6 +470,26 @@ fn icon(name: &str, size: f32, color: Hsla) -> gpui::Svg {
     svg().path(SharedString::from(format!("icons/{name}.svg"))).size(px(size)).flex_none().text_color(color)
 }
 
+/// A spinning ring for work in progress; `key` must be unique among the
+/// spinners on screen at once.
+fn spinner(key: impl Into<gpui::ElementId>, size: f32, color: Hsla) -> impl IntoElement {
+    icon("spinner", size, color).with_animation(key, Animation::new(Duration::from_millis(800)).repeat(), |s, d| {
+        s.with_transformation(Transformation::rotate(radians(d * std::f32::consts::TAU)))
+    })
+}
+
+/// An indeterminate progress bar: an orange segment sweeping across a track.
+fn progress_bar(key: &'static str, width: f32) -> impl IntoElement {
+    let seg = width * 0.35;
+    div().relative().w(px(width)).h(px(4.)).rounded_full().overflow_hidden().bg(brand_orange().opacity(0.18)).child(
+        div().absolute().top_0().h_full().w(px(seg)).rounded_full().bg(brand_orange()).with_animation(
+            key,
+            Animation::new(Duration::from_millis(1400)).repeat().with_easing(gpui::ease_in_out),
+            move |el, d| el.left(px(-seg + d * (width + seg))),
+        ),
+    )
+}
+
 /// The activity bar's Claude icon: a VTracer trace (see src/vector.rs).
 static CLAUDE_ICON: LazyLock<Arc<gpui::Image>> =
     LazyLock::new(|| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, crate::vector::CLAUDE_SVG.to_vec())));
@@ -1060,7 +1080,16 @@ impl Workbench {
         let mut list = div().id("device-menu-list").max_h(px(420.)).overflow_y_scroll().flex().flex_col();
         match &self.sim_devices {
             None => {
-                list = list.child(div().px(px(12.)).py(px(4.)).text_color(t.fg_muted).child("Loading simulators…"));
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(12.))
+                        .py(px(4.))
+                        .child(spinner("sim-loading", 14., brand_orange()))
+                        .child("Loading simulators…"),
+                );
             }
             Some(devices) => {
                 for (i, device) in devices.iter().enumerate() {
@@ -3985,7 +4014,19 @@ impl Workbench {
 
         // What's happening, or what went wrong (closable, with a way to start over).
         let status = match (a.busy, &a.error, &a.notice) {
-            (Some(busy), _, _) => Some(div().flex_none().px(px(20.)).pb(px(8.)).text_size(px(11.)).text_color(t.fg_muted).child(busy)),
+            (Some(busy), _, _) => Some(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(20.))
+                    .pb(px(8.))
+                    .text_size(px(12.))
+                    .text_color(t.fg)
+                    .child(spinner("asana-busy", 14., brand_orange()))
+                    .child(div().flex_1().min_w(px(0.)).child(busy)),
+            ),
             (None, Some(text), _) => Some(self.asana_alert("asana-error", text.clone(), t.error_fg, true, t, cx)),
             (None, None, Some(text)) => Some(self.asana_alert("asana-notice", text.clone(), t.fg_muted, false, t, cx)),
             _ => None,
@@ -4591,21 +4632,20 @@ impl Workbench {
     fn render_loader(&self, t: &Theme, glass: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let orange = brand_orange();
         let waited = self.opened_at.elapsed();
+        // Steps still running are bright with a spinner; finished ones dim
+        // behind a check, so the eye lands on what's left.
         let step = |key: &'static str, label: &'static str, done: bool| {
             let mark = if done {
-                icon("check", 13., t.success_fg).into_any_element()
+                icon("check", 18., t.success_fg).into_any_element()
             } else {
-                icon("restart", 13., orange)
-                    .with_animation(key, Animation::new(Duration::from_millis(900)).repeat(), |s, d| {
-                        s.with_transformation(Transformation::rotate(radians(d * std::f32::consts::TAU)))
-                    })
-                    .into_any_element()
+                spinner(key, 18., orange).into_any_element()
             };
             div()
                 .flex()
                 .items_center()
-                .gap(px(8.))
-                .text_color(if done { t.fg } else { t.fg_muted })
+                .gap(px(10.))
+                .text_color(if done { t.fg_muted } else { t.fg })
+                .font_weight(if done { gpui::FontWeight::NORMAL } else { gpui::FontWeight::SEMIBOLD })
                 .child(mark)
                 .child(label)
         };
@@ -4640,13 +4680,14 @@ impl Workbench {
                     .items_center()
                     .gap(px(18.))
                     .child(img(WELCOME_ICON.clone()).size(px(96.)).flex_none())
-                    .child(div().text_size(px(20.)).child("Claude Deck"))
+                    .child(div().text_size(px(22.)).font_weight(gpui::FontWeight::SEMIBOLD).child("Claude Deck"))
+                    .child(progress_bar("loader-bar", 240.))
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(6.))
-                            .text_size(px(12.))
+                            .gap(px(10.))
+                            .text_size(px(14.))
                             .child(step("loader-accounts", "Finding Claude Code and checking accounts", s.accounts))
                             .child(step("loader-themes", "Loading themes", s.themes))
                             .child(step("loader-apps", "Finding browsers and apps", s.apps)),
@@ -4654,8 +4695,8 @@ impl Workbench {
                     .child(
                         div()
                             .id("loader-skip")
-                            .h(px(18.))
-                            .text_size(px(12.))
+                            .h(px(20.))
+                            .text_size(px(13.))
                             .text_color(t.button_bg)
                             .when(waited >= STARTUP_SKIP_AFTER, |d| {
                                 d.cursor_pointer().hover(|s| s.underline()).child("Continue without waiting").on_click(cx.listener(
@@ -5209,11 +5250,7 @@ impl Workbench {
                 .map(|d| if enabled { d.cursor_pointer().hover(|s| s.opacity(0.85)) } else { d.opacity(0.4) })
                 .child(label.to_string())
         };
-        let spinner = |key: &'static str| {
-            icon("restart", 13., orange).with_animation(key, Animation::new(Duration::from_millis(900)).repeat(), |s, d| {
-                s.with_transformation(Transformation::rotate(radians(d * std::f32::consts::TAU)))
-            })
-        };
+        let spinner = |key: &'static str| spinner(key, 16., orange);
         let log_toggle = div()
             .id("srv-log-toggle")
             .text_size(px(11.))
@@ -5370,9 +5407,9 @@ impl Workbench {
                 let step_rows = steps.into_iter().enumerate().map(|(i, (label, state))| {
                     let mark = match state {
                         None => spinner(if i == 0 { "srv-spin-0" } else { "srv-spin-1" }).into_any_element(),
-                        Some(true) => icon("check", 13., green).into_any_element(),
+                        Some(true) => icon("check", 16., green).into_any_element(),
                         Some(false) => div()
-                            .size(px(13.))
+                            .size(px(16.))
                             .flex()
                             .items_center()
                             .justify_center()

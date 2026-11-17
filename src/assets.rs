@@ -30,6 +30,8 @@ fn icon(name: &str) -> Option<String> {
         "logout" => r#"<path d="M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3"/><path d="m16 17 5-5-5-5M21 12H9"/>"#,
         "external" => r#"<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>"#,
         "receipt" => r#"<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6M9 16h3"/>"#,
+        // A loading spinner: a faint ring with a heavy arc that rotates (see `spinner`).
+        "spinner" => r#"<circle cx="12" cy="12" r="9" stroke-width="3" stroke-opacity=".22"/><path stroke-width="3" d="M12 3a9 9 0 0 1 9 9"/>"#,
         "restart" => r#"<path d="M4 12a8 8 0 1 0 2.5-5.8"/><path d="M4 4v4h4"/>"#,
         "paint" => r#"<circle cx="12" cy="12" r="9"/><circle cx="8" cy="10" r="1.2"/><circle cx="12" cy="7.5" r="1.2"/><circle cx="16" cy="10" r="1.2"/><path d="M12 21a3 3 0 0 1 0-6h1.5a2 2 0 0 0 0-4"/>"#,
         "package" => r#"<path d="M12 3 4 7v10l8 4 8-4V7z"/><path d="m4 7 8 4 8-4M12 11v10"/>"#,
