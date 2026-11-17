@@ -1,6 +1,7 @@
 //! GitHub identities: the name/email a window's commits use, the SSH key
-//! its pushes authenticate with, and which `gh` CLI login it sees. Applied
-//! per window through environment variables; git config is never changed.
+//! its pushes authenticate with, the login its HTTPS pushes use, and which
+//! `gh` CLI login it sees. Applied per window through environment variables;
+//! git config is never changed (apart from the folder's saved login).
 
 use std::{
     path::{Path, PathBuf},
@@ -26,7 +27,7 @@ pub struct GitIdentity {
     pub gh_config_dir: Option<PathBuf>,
 }
 
-const VARS: [&str; 7] = [
+const VARS: [&str; 12] = [
     "GIT_AUTHOR_NAME",
     "GIT_AUTHOR_EMAIL",
     "GIT_COMMITTER_NAME",
@@ -34,7 +35,15 @@ const VARS: [&str; 7] = [
     "GIT_SSH_COMMAND",
     "GH_CONFIG_DIR",
     "CLAUDE_DECK_GITHUB",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_CONFIG_KEY_1",
+    "GIT_CONFIG_VALUE_1",
 ];
+
+/// Git config key for the credential helpers used with GitHub over HTTPS.
+const HTTPS_HELPER_KEY: &str = "credential.https://github.com.helper";
 
 pub fn expand_tilde(path: &PathBuf) -> PathBuf {
     match path.strip_prefix("~") {
@@ -51,6 +60,40 @@ impl GitIdentity {
         Some(format!("ssh -i '{}' -o IdentitiesOnly=yes -o IdentityAgent=none", key.display()))
     }
 
+    /// This identity with the author the repo sets for itself (`user.name`
+    /// and `user.email` in its own git config), when it sets one: the
+    /// environment would otherwise override it without a word.
+    pub fn for_repo(mut self, logins: &FolderLogins) -> Self {
+        if let Some(name) = &logins.author_name {
+            self.name = name.clone();
+        }
+        if let Some(email) = &logins.author_email {
+            self.email = email.clone();
+        }
+        self
+    }
+
+    /// A git credential helper that signs HTTPS pushes to github.com in as
+    /// this identity, the way `ssh_key` does for SSH remotes. Without it git
+    /// uses whichever GitHub login the Mac's keychain holds, which can be
+    /// another account ("Repository not found"). The token comes from the
+    /// `gh` CLI's login for this user each time git asks, and goes straight
+    /// to git: it's never stored, logged or put in the environment. If `gh`
+    /// has no login for this user, git's usual helpers answer as before.
+    /// None for a username that couldn't be a GitHub login.
+    pub fn https_helper(&self) -> Option<String> {
+        let user = &self.github_user;
+        let valid = !user.is_empty() && user.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        valid.then(|| {
+            format!(
+                "!f() {{ test \"$1\" = get || exit 0; \
+                 t=$(gh auth token --hostname github.com --user {user} 2>/dev/null); \
+                 if test -n \"$t\"; then echo username={user}; echo \"password=$t\"; \
+                 else gh auth git-credential get 2>/dev/null || git credential-osxkeychain get; fi; }}; f"
+            )
+        })
+    }
+
     pub fn apply_env(&self, cmd: &mut CommandBuilder) {
         clear_env(cmd);
         cmd.env("GIT_AUTHOR_NAME", &self.name);
@@ -65,6 +108,15 @@ impl GitIdentity {
             let dir = expand_tilde(dir);
             let _ = std::fs::create_dir_all(&dir);
             cmd.env("GH_CONFIG_DIR", dir);
+        }
+        if let Some(helper) = self.https_helper() {
+            // An empty value first drops the helpers set in git config, so
+            // ours is the one asked.
+            cmd.env("GIT_CONFIG_COUNT", "2");
+            cmd.env("GIT_CONFIG_KEY_0", HTTPS_HELPER_KEY);
+            cmd.env("GIT_CONFIG_VALUE_0", "");
+            cmd.env("GIT_CONFIG_KEY_1", HTTPS_HELPER_KEY);
+            cmd.env("GIT_CONFIG_VALUE_1", helper);
         }
     }
 }
@@ -139,12 +191,25 @@ pub struct FolderLogins {
     pub owner: Option<String>,
     /// Web page of its `origin` remote, when that's on GitHub.
     pub web: Option<String>,
+    /// The commit author the repo sets in its own git config, if it does.
+    pub author_name: Option<String>,
+    pub author_email: Option<String>,
 }
 
 impl FolderLogins {
     /// The saved login, then the remote's owner.
     pub fn best_first(&self) -> impl Iterator<Item = &str> {
         self.saved.iter().chain(&self.owner).map(String::as_str)
+    }
+
+    /// "Name <email>" when the repo sets its own commit author.
+    pub fn author(&self) -> Option<String> {
+        match (&self.author_name, &self.author_email) {
+            (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
+            (Some(name), None) => Some(name.clone()),
+            (None, Some(email)) => Some(format!("<{email}>")),
+            (None, None) => None,
+        }
     }
 }
 
@@ -156,6 +221,8 @@ pub fn folder_logins(dir: &Path) -> FolderLogins {
         saved: git(dir, &["config", "--get", FOLDER_KEY]),
         owner: origin.as_deref().and_then(remote_owner),
         web: origin.as_deref().and_then(remote_web_url),
+        author_name: git(dir, &["config", "--local", "--get", "user.name"]),
+        author_email: git(dir, &["config", "--local", "--get", "user.email"]),
     }
 }
 
@@ -213,11 +280,99 @@ mod tests {
         let mut cmd = CommandBuilder::new("true");
         cmd.env("GH_CONFIG_DIR", "/elsewhere");
         id.apply_env(&mut cmd);
-        let get = |k: &str| cmd.get_env(k).map(|v| v.to_string_lossy().into_owned());
+        fn get_from(cmd: &CommandBuilder, k: &str) -> Option<String> {
+            cmd.get_env(k).map(|v| v.to_string_lossy().into_owned())
+        }
+        let get = |k: &str| get_from(&cmd, k);
         assert_eq!(get("GIT_AUTHOR_NAME").as_deref(), Some("My Name"));
         assert_eq!(get("GIT_COMMITTER_EMAIL").as_deref(), Some("me@example.com"));
         let ssh = get("GIT_SSH_COMMAND").unwrap();
         assert!(ssh.contains("id_ed25519_personal") && ssh.contains("IdentityAgent=none") && !ssh.contains('~'));
         assert_eq!(get("GH_CONFIG_DIR"), None, "personal identity uses the normal gh config");
+        // HTTPS pushes: git's own helpers are dropped, then ours is added.
+        assert_eq!(get("GIT_CONFIG_COUNT").as_deref(), Some("2"));
+        assert_eq!(get("GIT_CONFIG_KEY_0").as_deref(), Some(HTTPS_HELPER_KEY));
+        assert_eq!(get("GIT_CONFIG_VALUE_0").as_deref(), Some(""));
+        assert_eq!(get("GIT_CONFIG_KEY_1").as_deref(), Some(HTTPS_HELPER_KEY));
+        assert!(get("GIT_CONFIG_VALUE_1").unwrap().contains("gh auth token --hostname github.com --user jderifaj"));
+
+        clear_env(&mut cmd);
+        assert_eq!(get_from(&cmd, "GIT_AUTHOR_NAME"), None);
+        assert_eq!(get_from(&cmd, "GIT_CONFIG_COUNT"), None);
+    }
+
+    fn identity(user: &str) -> GitIdentity {
+        GitIdentity { github_user: user.into(), name: "Work Name".into(), email: "me@work.example".into(), ssh_key: None, gh_config_dir: None }
+    }
+
+    #[test]
+    fn the_repos_own_author_wins() {
+        let repo = FolderLogins {
+            author_name: Some("me".into()),
+            author_email: Some("12345+me@users.noreply.github.com".into()),
+            ..Default::default()
+        };
+        let id = identity("work-user").for_repo(&repo);
+        assert_eq!((id.name.as_str(), id.email.as_str()), ("me", "12345+me@users.noreply.github.com"));
+        assert_eq!(id.github_user, "work-user", "pushes still use the chosen account");
+        assert_eq!(repo.author().as_deref(), Some("me <12345+me@users.noreply.github.com>"));
+
+        let unset = FolderLogins::default();
+        assert_eq!(identity("work-user").for_repo(&unset), identity("work-user"));
+        assert_eq!(unset.author(), None);
+    }
+
+    #[test]
+    fn no_https_helper_for_an_odd_username() {
+        assert!(identity("me; rm -rf ~").https_helper().is_none());
+        assert!(identity("").https_helper().is_none());
+    }
+
+    /// Runs the helper the way git does, with stand-ins for `gh` and for
+    /// git's keychain helper on PATH.
+    #[test]
+    fn https_helper_hands_git_the_identitys_token() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("claude-deck-helper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // `gh` knows a token for "me" only, and has no active login.
+        script("gh", r#"[ "$1 $2" = "auth token" ] && [ "$6" = me ] && echo tok-me && exit 0; exit 1"#);
+        script("git-credential-osxkeychain", "echo username=keychain; echo password=tok-keychain");
+
+        let ask = |user: &str| {
+            let helper = identity(user).https_helper().unwrap();
+            let path = format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default());
+            let mut child = Command::new("git")
+                .args(["-c", "credential.helper=", "-c", &format!("{HTTPS_HELPER_KEY}={helper}"), "credential", "fill"])
+                .env("PATH", path)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                // Helpers are looked up here first, so the stand-in is run,
+                // never the real keychain helper.
+                .env("GIT_EXEC_PATH", &dir)
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_ASKPASS")
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child.stdin.take().unwrap().write_all(b"protocol=https\nhost=github.com\n\n").unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let mine = ask("me");
+        assert!(mine.contains("username=me") && mine.contains("password=tok-me"), "{mine}");
+        // No `gh` login for this user: git's keychain helper answers instead.
+        let other = ask("someone-else");
+        assert!(other.contains("username=keychain") && other.contains("password=tok-keychain"), "{other}");
     }
 }

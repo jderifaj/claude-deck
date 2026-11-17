@@ -9,6 +9,7 @@ mod git_identity;
 mod guard;
 mod glass;
 mod settings;
+mod sync;
 mod terminal;
 mod text_field;
 mod theme;

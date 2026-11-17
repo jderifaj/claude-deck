@@ -39,6 +39,22 @@ that port, the Chrome button opens nothing for the session. The only listener is
 (cwd `~/Library/Containers/com.docker.docker/Data`), so `find_server_port` returns `None`. The project has no
 `index.html` to fall back to.
 
+**Fixed (2026-11-13):**
+
+- `listening_ports` (`src/browser.rs`) now keeps the address of every listener. When another process has the
+  chosen port, the URL uses the address that reaches the session's own server (`127.0.0.1` or `[::1]`);
+  `localhost` is used only when nobody else has the port. The "Opened …" notice adds "Port 4321 is also used
+  by node (site-b)."
+- Docker Compose services are found by their project folder (see the last issue below), so a Docker-only
+  project gets its page.
+- A server the webserver button only *found* running is looked up again on every browser button press and
+  each time its dialog is reopened, instead of reusing the URL saved the first time. That saved URL could
+  outlive the server and point at another project that took the port later.
+- A dev server Claude Deck starts counts as ready only when it, or something it started, is what listens on
+  the port. If another process took the port first and the server moved up one (Astro does this), the dialog
+  and the browser buttons follow it to the port it took. This is the likely cause of Device Hub showing
+  another project's site on 2026-11-12, though that wasn't reproduced.
+
 ## A window's Git identity overrides the repo's own author, and doesn't cover HTTPS pushes
 
 **Seen:** 2026-11-02, in a session for `~/Sites/app-a` (remote
@@ -93,6 +109,19 @@ Moving this into Claude Deck would fix the problems above at the source:
 - Show the result in the window ("GitHub: me · saved for this folder"), and let the user change it there,
   writing `claude.githubUser`.
 - Once Claude Deck does this, the Claude Code hook can be removed.
+
+**Fixed (2026-11-13), on top of the folder-first choice from 064cbc3:**
+
+- The repo's own author wins. `folder_logins` reads `user.name` and `user.email` from the repo's local config
+  (in the background, with the other lookups), and `GitIdentity::for_repo` uses them for
+  `GIT_AUTHOR_*`/`GIT_COMMITTER_*`. The Git menu says so: "Commits in this folder are authored as …".
+- HTTPS remotes are covered. Each window with an identity gets a credential helper for `https://github.com`
+  through `GIT_CONFIG_*` variables (`GitIdentity::https_helper`). It asks `gh auth token --user <login>` each
+  time git needs a login, so the token is never stored or put in the environment. If `gh` has no login for
+  that user, git falls back to `gh`'s active account, then the keychain, as before.
+- Not done: setting `GH_TOKEN` for the window, so the `gh` CLI itself still uses its active account unless the
+  identity has its own `ghConfigDir`. The `~/.claude/hooks/github-account.sh` hook still does that, so keep it
+  for now.
 
 ## Beachball at launch while windows look up their GitHub identity
 
@@ -228,6 +257,17 @@ The project layout that triggers it: `docker-compose.yml` at the root, the Node 
   - Collapse `0.0.0.0` and `[::]` duplicates.
   - Skip unpublished ports.
   - Classify `HTTP/1.1 200` as web and `220 mailpit ESMTP` as not.
+
+**Done (2026-11-13)** as proposed, in `src/webserver.rs` (`compose_services`, `parse_compose_ports`,
+`answers_http`, `compose_primary`, `has_compose_file`) and `src/workbench.rs` (`ServerFound::Compose`,
+`ServerFound::ComposeStopped`, the service rows in `render_server_panel`). Differences from the proposal:
+
+- The HTTP check waits up to 1 second per port, not 300 ms, since a dev server in a container can be slow to
+  answer its first request. The ports are checked at the same time.
+- UDP ports are left out of the list.
+- `docker` is looked for in Homebrew's and Docker Desktop's folders as well as `PATH`, which is short when the
+  app is opened from the Finder. This also fixes `pick_port` missing Docker-published ports in that case.
+- Tested with unit tests only: Docker wasn't running, so the panel hasn't been seen with a live stack yet.
 
 **Out of scope for now:**
 

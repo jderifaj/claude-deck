@@ -1,16 +1,14 @@
 //! Bitmap -> SVG tracing with VTracer (https://lib.rs/crates/vtracer).
 //!
 //! The activity bar shows every icon as a traced vector: installed apps'
-//! icons are traced at runtime (see `browser::app_icon`), and the Claude and
-//! theme icons are traced ahead of time by `cargo run --example trace_icons`
-//! into `assets/icons/`.
+//! icons are traced at runtime (see `browser::app_icon`), and the Claude icon
+//! is traced ahead of time by `cargo run --example trace_icons` into
+//! `assets/icons/`. (The Themes icon is hand-written: `theme-colors.svg`.)
 
 use std::path::Path;
 
 /// The Claude mark, traced from an orange raster.
 pub const CLAUDE_SVG: &[u8] = include_bytes!("../assets/icons/claude.svg");
-/// Color bars (the theme view), traced from a raster test pattern.
-pub const COLOR_BARS_SVG: &[u8] = include_bytes!("../assets/icons/color-bars.svg");
 
 /// Trace a full-color app icon PNG into an SVG file.
 pub fn trace_file(png: &Path, svg: &Path) -> Result<(), String> {

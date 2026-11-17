@@ -270,11 +270,25 @@ fn walk(root: &Path, dir: &Path, depth: usize, f: &mut dyn FnMut(&Path)) {
 }
 
 fn on_path(program: &str) -> bool {
+    find_program(program).is_some()
+}
+
+/// Where `program` is: on PATH, or in the usual folders PATH lacks when
+/// Claude Deck was opened from the Finder (Homebrew, Docker Desktop).
+fn find_program(program: &str) -> Option<PathBuf> {
+    let extra = ["/opt/homebrew/bin", "/usr/local/bin", "/Applications/Docker.app/Contents/Resources/bin"].map(PathBuf::from);
     std::env::var_os("PATH")
         .into_iter()
         .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
-        .any(|d| d.join(program).is_file())
+        .chain(extra)
+        .chain(dirs::home_dir().map(|h| h.join(".docker/bin")))
+        .map(|d| d.join(program))
+        .find(|p| p.is_file())
+}
+
+/// `docker`, by its full path when it can be found.
+fn docker() -> Command {
+    Command::new(find_program("docker").unwrap_or_else(|| PathBuf::from("docker")))
 }
 
 // ---- pages ---------------------------------------------------------------
@@ -363,13 +377,9 @@ fn taken_ports() -> Vec<(u16, String)> {
     let pids: Vec<u32> = listening.keys().copied().collect();
     let cwds = crate::browser::process_cwds(&pids);
     let mut taken = Vec::new();
-    for (pid, (command, ports)) in &listening {
-        let folder = cwds.get(pid).and_then(|c| c.file_name()).map(|n| n.to_string_lossy().into_owned());
-        let who = match folder {
-            Some(f) if f != "/" && !f.is_empty() => format!("{command} ({f})"),
-            _ => command.clone(),
-        };
-        taken.extend(ports.iter().map(|&p| (p, who.clone())));
+    for (pid, listener) in &listening {
+        let who = crate::browser::who(&listener.command, cwds.get(pid).map(PathBuf::as_path));
+        taken.extend(listener.ports().map(|p| (p, who.clone())));
     }
     taken.extend(docker_ports());
     taken
@@ -378,10 +388,7 @@ fn taken_ports() -> Vec<(u16, String)> {
 /// Host ports published by running Docker containers, with the container
 /// name. Empty if Docker isn't installed or running.
 fn docker_ports() -> Vec<(u16, String)> {
-    let Some(text) = output_within(
-        Command::new("docker").args(["ps", "--format", "{{.Names}}\t{{.Ports}}"]),
-        Duration::from_secs(2),
-    ) else {
+    let Some(text) = output_within(docker().args(["ps", "--format", "{{.Names}}\t{{.Ports}}"]), Duration::from_secs(2)) else {
         return Vec::new();
     };
     parse_docker_ports(&text)
@@ -391,19 +398,167 @@ fn parse_docker_ports(text: &str) -> Vec<(u16, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
         let Some((name, ports)) = line.split_once('\t') else { continue };
-        // "0.0.0.0:4321->4321/tcp, [::]:4321->4321/tcp"
-        for mapping in ports.split(", ") {
-            let Some((host, _)) = mapping.split_once("->") else { continue };
-            if let Some(port) = host.rsplit(':').next().and_then(|p| p.parse::<u16>().ok()) {
-                out.push((port, format!("Docker container {name}")));
+        out.extend(published(ports).into_iter().map(|p| (p.host_port, format!("Docker container {name}"))));
+    }
+    out
+}
+
+/// One published port from `docker ps`'s Ports column.
+struct Published {
+    /// "0.0.0.0", "127.0.0.1", "::", "::1" …
+    host_ip: String,
+    host_port: u16,
+    container_port: u16,
+    tcp: bool,
+}
+
+/// The published mappings in a Ports column such as
+/// "0.0.0.0:4321->4321/tcp, [::]:4321->4321/tcp, 5432/tcp". Unpublished
+/// ports (no `->`) are skipped, and port ranges give one entry per port.
+fn published(ports: &str) -> Vec<Published> {
+    let range = |s: &str| -> Option<std::ops::RangeInclusive<u16>> {
+        let (from, to) = s.split_once('-').unwrap_or((s, s));
+        Some(from.parse().ok()?..=to.parse().ok()?)
+    };
+    let mut out = Vec::new();
+    for mapping in ports.split(", ") {
+        let Some((host, container)) = mapping.trim().split_once("->") else { continue };
+        let (container_ports, protocol) = container.split_once('/').unwrap_or((container, "tcp"));
+        let Some((ip, host_ports)) = host.rsplit_once(':') else { continue };
+        let (Some(host_ports), Some(container_ports)) = (range(host_ports), range(container_ports)) else { continue };
+        for (host_port, container_port) in host_ports.zip(container_ports) {
+            out.push(Published {
+                host_ip: ip.trim_matches(['[', ']']).to_string(),
+                host_port,
+                container_port,
+                tcp: protocol == "tcp",
+            });
+        }
+    }
+    out
+}
+
+// ---- Docker Compose -----------------------------------------------------------
+
+/// A port one of a folder's Docker Compose services publishes on this Mac.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComposePort {
+    pub service: String,
+    /// The address it's published on: "127.0.0.1", "0.0.0.0", "::1" …
+    pub host_ip: String,
+    pub host_port: u16,
+    pub container_port: u16,
+    /// It answers HTTP, so it can be opened in a browser.
+    pub web: bool,
+}
+
+impl ComposePort {
+    /// The loopback address that reaches it. Never `localhost`, which another
+    /// project's `[::1]` listener on the same port would capture.
+    fn host(&self) -> String {
+        match self.host_ip.as_str() {
+            "" | "0.0.0.0" | "127.0.0.1" => "127.0.0.1".into(),
+            "::" | "::1" => "[::1]".into(),
+            ip if ip.contains(':') => format!("[{ip}]"),
+            ip => ip.into(),
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}:{}", self.host(), self.host_port)
+    }
+}
+
+/// Whether `dir` has a Docker Compose file.
+pub fn has_compose_file(dir: &Path) -> bool {
+    ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"].iter().any(|f| dir.join(f).is_file())
+}
+
+/// The ports published by the running Compose services whose project folder
+/// is `dir`, each probed to see whether it's a web page. Empty when there are
+/// none, or when Docker is missing, stopped or slow. Runs `docker ps` and
+/// waits up to a second for replies, so call it off the main thread.
+pub fn compose_services(dir: &Path) -> Vec<ComposePort> {
+    // Compose records the folder with symlinks resolved.
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let filter = format!("label=com.docker.compose.project.working_dir={}", dir.display());
+    let format = "{{.Label \"com.docker.compose.service\"}}\t{{.Ports}}";
+    let Some(text) = output_within(docker().args(["ps", "--filter", &filter, "--format", format]), Duration::from_secs(2)) else {
+        return Vec::new();
+    };
+    let mut ports = parse_compose_ports(&text);
+    std::thread::scope(|scope| {
+        for port in &mut ports {
+            scope.spawn(move || port.web = answers_http(&port.host(), port.host_port));
+        }
+    });
+    sort_compose_ports(&mut ports);
+    ports
+}
+
+/// Published TCP ports from `docker ps` lines of "service\tports". A port
+/// published on both IPv4 and IPv6 is listed once (as IPv4).
+fn parse_compose_ports(text: &str) -> Vec<ComposePort> {
+    let mut out: Vec<ComposePort> = Vec::new();
+    for line in text.lines() {
+        let Some((service, ports)) = line.split_once('\t') else { continue };
+        let service = service.trim();
+        for p in published(ports).into_iter().filter(|p| p.tcp) {
+            let ipv6 = p.host_ip.contains(':');
+            match out.iter_mut().find(|o| o.service == service && o.host_port == p.host_port) {
+                Some(seen) if seen.host_ip.contains(':') && !ipv6 => seen.host_ip = p.host_ip,
+                Some(_) => {}
+                None => out.push(ComposePort {
+                    service: service.to_string(),
+                    host_ip: p.host_ip,
+                    host_port: p.host_port,
+                    container_port: p.container_port,
+                    web: false,
+                }),
             }
         }
     }
     out
 }
 
+/// By service, web pages first, then by port.
+fn sort_compose_ports(ports: &mut [ComposePort]) {
+    ports.sort_by(|a, b| a.service.cmp(&b.service).then(b.web.cmp(&a.web)).then(a.host_port.cmp(&b.host_port)));
+}
+
+/// The port the browser buttons open: the lowest-numbered web one.
+pub fn compose_primary(ports: &[ComposePort]) -> Option<&ComposePort> {
+    ports.iter().filter(|p| p.web).min_by_key(|p| p.host_port)
+}
+
+/// Whether `host:port` answers an HTTP request within a second. Other
+/// services say something else (an SMTP banner) or nothing at all.
+fn answers_http(host: &str, port: u16) -> bool {
+    let wait = Duration::from_secs(1);
+    let Ok(addr) = format!("{host}:{port}").parse::<SocketAddr>() else { return false };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, wait) else { return false };
+    let _ = stream.set_read_timeout(Some(wait));
+    let _ = stream.set_write_timeout(Some(wait));
+    if stream.write_all(b"HEAD / HTTP/1.0\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut reply = [0u8; 8];
+    let mut got = 0;
+    while got < 5 {
+        match stream.read(&mut reply[got..]) {
+            Ok(n) if n > 0 => got += n,
+            _ => break,
+        }
+    }
+    looks_like_http(&reply[..got])
+}
+
+fn looks_like_http(reply: &[u8]) -> bool {
+    reply.starts_with(b"HTTP/")
+}
+
 /// A command's stdout, or None if it fails or takes longer than `limit`.
-fn output_within(cmd: &mut Command, limit: Duration) -> Option<String> {
+pub(crate) fn output_within(cmd: &mut Command, limit: Duration) -> Option<String> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let deadline = Instant::now() + limit;
     loop {
@@ -433,6 +588,39 @@ pub fn is_listening(port: u16, any_loopback: bool) -> bool {
             .is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_ok())
     };
     try_addr(&format!("127.0.0.1:{port}")) || (any_loopback && try_addr(&format!("[::1]:{port}")))
+}
+
+/// The port a dev server started as process `pid` answers on, once it does.
+/// That's `port` when the server (or anything it started) is what listens
+/// there. If another process holds `port`, a server such as Astro quietly
+/// moves to the next free one: then it's the port the server did take. None
+/// while it isn't up yet, so a stranger on `port` is never taken for it.
+pub fn ready_port(pid: u32, port: u16, any_loopback: bool, dir: &Path) -> Option<u16> {
+    if !is_listening(port, any_loopback) {
+        return None;
+    }
+    let listening = crate::browser::listening_ports();
+    if listening.is_empty() {
+        return Some(port); // lsof told us nothing, so there's nothing to check against
+    }
+    let mut tree = crate::browser::descendants_of(pid);
+    tree.insert(pid);
+    let ours: Vec<u16> = listening.iter().filter(|(p, _)| tree.contains(p)).flat_map(|(_, l)| l.ports()).collect();
+    let holders: Vec<u32> = listening.iter().filter(|(_, l)| l.ports().any(|p| p == port)).map(|(p, _)| *p).collect();
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let cwds = crate::browser::process_cwds(&holders);
+    moved_port(port, &ours, holders.iter().any(|p| cwds.get(p).is_some_and(|cwd| cwd.starts_with(&dir))))
+}
+
+/// See `ready_port`. `ours`: ports the server's process tree listens on;
+/// `holder_in_folder`: whether a process holding `port` runs in the project
+/// folder (a server that detached from the process tree).
+fn moved_port(port: u16, ours: &[u16], holder_in_folder: bool) -> Option<u16> {
+    if ours.contains(&port) || (ours.is_empty() && holder_in_folder) {
+        return Some(port);
+    }
+    // The next port up, as dev servers pick it; else whatever it took.
+    ours.iter().copied().filter(|p| *p > port).min().or_else(|| ours.iter().copied().min())
 }
 
 impl Project {
@@ -560,6 +748,10 @@ impl ServerProcess {
             });
         }
         Ok(Self { child, stopped: false })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Some(success) once the process has exited.
@@ -914,6 +1106,94 @@ mod tests {
         process.stop();
         std::thread::sleep(Duration::from_millis(800));
         assert!(!project.is_ready(port), "still listening after stop");
+    }
+
+    #[test]
+    fn parses_compose_services() {
+        // The stack from ISSUES.md, plus a port on both IPv4 and IPv6, an
+        // unpublished one, a UDP one and a range.
+        let text = "app\t127.0.0.1:4321->4321/tcp\n\
+                    assets\t127.0.0.1:8081->80/tcp\n\
+                    mailpit\t127.0.0.1:1025->1025/tcp, 127.0.0.1:8025->8025/tcp\n\
+                    web\t[::]:3000->3000/tcp, 0.0.0.0:3000->3000/tcp, :::9000->9000/tcp\n\
+                    db\t5432/tcp, 0.0.0.0:5353->53/udp\n\
+                    range\t0.0.0.0:7000-7001->8000-8001/tcp\n";
+        let mut ports = parse_compose_ports(text);
+        let row = |p: &ComposePort| (p.service.clone(), p.host_port, p.container_port, p.url());
+        let rows: Vec<_> = ports.iter().map(row).collect();
+        let expect = |service: &str, host: u16, container: u16, url: &str| (service.to_string(), host, container, url.to_string());
+        assert_eq!(
+            rows,
+            [
+                expect("app", 4321, 4321, "http://127.0.0.1:4321"),
+                expect("assets", 8081, 80, "http://127.0.0.1:8081"),
+                expect("mailpit", 1025, 1025, "http://127.0.0.1:1025"),
+                expect("mailpit", 8025, 8025, "http://127.0.0.1:8025"),
+                expect("web", 3000, 3000, "http://127.0.0.1:3000"),
+                expect("web", 9000, 9000, "http://[::1]:9000"),
+                expect("range", 7000, 8000, "http://127.0.0.1:7000"),
+                expect("range", 7001, 8001, "http://127.0.0.1:7001"),
+            ]
+        );
+
+        // Web pages first within a service; the lowest web port is primary.
+        for p in &mut ports {
+            p.web = !matches!(p.host_port, 1025 | 7000 | 7001);
+        }
+        sort_compose_ports(&mut ports);
+        let order: Vec<_> = ports.iter().filter(|p| p.service == "mailpit").map(|p| p.host_port).collect();
+        assert_eq!(order, [8025, 1025]);
+        assert_eq!(compose_primary(&ports).unwrap().host_port, 3000);
+        assert!(compose_primary(&ports[..0]).is_none());
+    }
+
+    #[test]
+    fn tells_web_replies_from_other_services() {
+        assert!(looks_like_http(b"HTTP/1.1 200 OK"));
+        assert!(looks_like_http(b"HTTP/1.0 404"));
+        assert!(!looks_like_http(b"220 mailpit ESMTP"));
+        assert!(!looks_like_http(b""));
+    }
+
+    #[test]
+    fn probes_ports_for_http() {
+        let dir = temp_dir("probe");
+        write(&dir, "index.html", "<h1>hello</h1>");
+        let (port, _) = pick_port(18_520);
+        let server = StaticServer::start(&dir, port, &Log::default()).unwrap();
+        assert!(answers_http("127.0.0.1", port));
+        server.stop();
+
+        // A mail server greets first, and never speaks HTTP.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let smtp = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"220 mailpit ESMTP Service ready\r\n");
+            }
+        });
+        assert!(!answers_http("127.0.0.1", smtp));
+    }
+
+    #[test]
+    fn finds_compose_files() {
+        let dir = temp_dir("compose");
+        assert!(!has_compose_file(&dir));
+        write(&dir, "docker-compose.yml", "services: {}");
+        assert!(has_compose_file(&dir));
+    }
+
+    #[test]
+    fn a_stranger_on_the_port_is_not_our_server() {
+        // Ours listens where we asked.
+        assert_eq!(moved_port(4322, &[4322], false), Some(4322));
+        // Another project holds 4322 and ours isn't up yet.
+        assert_eq!(moved_port(4322, &[], false), None);
+        // Astro moved up to 4323 (and has a side port open).
+        assert_eq!(moved_port(4322, &[24678, 4323], false), Some(4323));
+        assert_eq!(moved_port(4322, &[3000], false), Some(3000));
+        // A server that left our process tree but runs in the folder.
+        assert_eq!(moved_port(4322, &[], true), Some(4322));
     }
 
     #[test]

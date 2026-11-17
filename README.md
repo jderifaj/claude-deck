@@ -17,7 +17,7 @@ in one window.
 - **Integrated developer tools:** start a project's local dev server (Astro, Next.js, Vite, Hugo, Jekyll,
   static HTML and more) on a free port, open its page in Chrome, Safari or Firefox, and test it on iPhone and
   iPad simulators when Xcode is installed.
-- **Side panel:** keep your charge codes at hand for time tracking, and see your open Asana tasks grouped by
+- **Side panel:** keep your charge codes at hand for time tracking (drag sections and codes to reorder them), and see your open Asana tasks grouped by
   due date (optional; your Asana token is stored in the macOS Keychain).
 - **Flexible theming:** use any VS Code theme for the whole app, or give a single window its own theme to tell
   sessions apart.
@@ -61,13 +61,24 @@ cargo run --release -- ~/Sites/proj # or run directly, opening sessions for fold
 
 ## Sessions
 - **⌘T** new session in the current project · **⌘O** open folder · **⌘W** close
+- Next to each window's branch badge, **↑N** is commits to push and **↓N** commits to pull (a check means
+  up to date). Counts refresh every 15 seconds and the remote is fetched every 5 minutes; click to check now.
+- At launch a loader covers the window until Claude Code, account logins, themes and app icons are found
+  (at most 15 seconds, with a skip link after 4).
 - **⌥⌘←/→** switch sessions · **⌘\\** grid ↔ tabs · **⌘B** side bar · **⇧⌘E / ⇧⌘T** sessions / themes
 - Shift/Option+Enter inserts a newline in Claude's prompt; ⌘C / ⌘V copy and paste.
 
 ## Browsers
 The Chrome, Safari and Firefox buttons in the far-left bar (shown for those installed) open the active session's
 local page: a server listening on a local port that the session started or that runs in its folder (preferring
-the session's own, then the lowest port), else the folder's `index.html`. A notice shows which URL opened.
+the session's own, then the lowest port), else the lowest web port its Docker Compose services publish, else
+the folder's `index.html`. A notice shows which URL opened. If another project listens on the same port, the
+URL uses the address that reaches this session's server (`127.0.0.1` or `[::1]` rather than `localhost`), and
+the notice names the other process.
+
+The webserver button starts the folder's dev server on a free port, or shows the one already running. For a
+folder whose Docker Compose services are up, it lists every published port by service, with links for the ones
+that answer as web pages; it doesn't start or stop Compose.
 
 Below them, the Device Hub button (shown once Xcode is installed) lists the iPhone and iPad simulators
 Xcode has (any you add in DeviceHub show up the next time the menu opens). Picking one opens the same page
@@ -108,6 +119,12 @@ starting fresh, or choose **Add another account…** and sign in inside the wind
 Each account is a separate Claude Code profile: your normal login (`~/.claude`) is the default, and added
 accounts live in `~/.claude-deck/accounts/<name>` (used as `CLAUDE_CONFIG_DIR`), each with its own login and
 history. Login status is checked with `claude auth status` every 10 seconds.
+
+## GitHub identities
+A window's GitHub identity (`gitIdentities` in the settings) comes from its folder first, a login saved for the
+repo or the owner of its `origin` remote, then from its Claude account. It sets the commit author, the SSH key
+for SSH remotes, and the `gh` login used for HTTPS pushes to github.com (the token is asked from `gh` each time
+and never stored). A repo that sets `user.name` or `user.email` in its own git config keeps that author.
 
 ## Themes
 The Themes view (⇧⌘T) sets the default theme, which the app and every new window use. Themes come from

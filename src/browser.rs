@@ -178,19 +178,65 @@ fn trace(png: &Path, svg: &Path) -> PathBuf {
     }
 }
 
-/// The page to show for a session: a local server started from the session
-/// (a process under `root_pid`) or running in its folder, else the folder's
-/// index.html.
-pub fn find_local_page(root_pid: Option<u32>, dir: &Path) -> Option<String> {
-    if let Some(port) = find_server_port(root_pid, dir) {
-        return Some(format!("http://localhost:{port}"));
-    }
-    let index = dir.join("index.html");
-    index.is_file().then(|| format!("file://{}", index.display()))
+/// A session's local page, and who else listens on its port.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalPage {
+    pub url: String,
+    /// Another process listening on the same port ("node (site-b)"), when
+    /// there is one: worth telling the user, since `localhost` could reach it.
+    pub shared_with: Option<String>,
 }
 
-fn find_server_port(root_pid: Option<u32>, dir: &Path) -> Option<u16> {
+impl LocalPage {
+    /// " Port 4321 is also used by node (site-b)." for notices, else "".
+    pub fn shared_note(&self) -> String {
+        match (&self.shared_with, port_of(&self.url)) {
+            (Some(who), Some(port)) => format!(" Port {port} is also used by {who}."),
+            _ => String::new(),
+        }
+    }
+}
+
+/// The port in an `http://host:port/...` URL.
+pub fn port_of(url: &str) -> Option<u16> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    authority.rsplit_once(':')?.1.parse().ok()
+}
+
+/// The page to show for a session: a local server started from the session
+/// (a process under `root_pid`) or running in its folder, else a web port its
+/// Docker Compose services publish, else the folder's index.html.
+pub fn find_local_page(root_pid: Option<u32>, dir: &Path) -> Option<LocalPage> {
     let listening = listening_ports();
+    if let Some(page) = server_page(&listening, root_pid, dir) {
+        return Some(page);
+    }
+    let services = crate::webserver::compose_services(dir);
+    if let Some(primary) = crate::webserver::compose_primary(&services) {
+        return Some(compose_page(&listening, primary.url(), primary.host_port));
+    }
+    let index = dir.join("index.html");
+    index.is_file().then(|| LocalPage { url: format!("file://{}", index.display()), shared_with: None })
+}
+
+/// A local server started from the session or running in its folder.
+pub fn find_server(root_pid: Option<u32>, dir: &Path) -> Option<LocalPage> {
+    server_page(&listening_ports(), root_pid, dir)
+}
+
+/// The page for a port Docker publishes, noting any other process on it.
+/// (Docker's own listener, `com.docker.backend`, is the port itself.)
+pub fn compose_page(listening: &HashMap<u32, Listener>, url: String, port: u16) -> LocalPage {
+    let others: Vec<u32> = listening
+        .iter()
+        .filter(|(_, l)| l.ports().any(|p| p == port) && !l.command.starts_with("com.docke"))
+        .map(|(pid, _)| *pid)
+        .collect();
+    LocalPage { url, shared_with: describe(listening, &others) }
+}
+
+fn server_page(listening: &HashMap<u32, Listener>, root_pid: Option<u32>, dir: &Path) -> Option<LocalPage> {
     if listening.is_empty() {
         return None;
     }
@@ -199,28 +245,103 @@ fn find_server_port(root_pid: Option<u32>, dir: &Path) -> Option<u16> {
     let cwds = process_cwds(&pids);
 
     // Prefer servers the session started, then the lowest port.
-    listening
+    let (pid, port) = listening
         .iter()
-        .filter(|(pid, (command, _))| Some(**pid) != root_pid && !command.to_lowercase().contains("claude"))
-        .filter_map(|(pid, (_, ports))| {
+        .filter(|(pid, l)| Some(**pid) != root_pid && !l.command.to_lowercase().contains("claude"))
+        .filter_map(|(pid, l)| {
             let ours = descendants.contains(pid);
             let in_dir = cwds.get(pid).is_some_and(|cwd| cwd.starts_with(dir));
-            (ours || in_dir).then(|| ports.iter().map(move |&port| (ours, port)))
+            (ours || in_dir).then(|| l.ports().map(move |port| (ours, *pid, port)))
         })
         .flatten()
-        .max_by_key(|&(ours, port)| (ours, std::cmp::Reverse(port)))
-        .map(|(_, port)| port)
+        .max_by_key(|&(ours, _, port)| (ours, std::cmp::Reverse(port)))
+        .map(|(_, pid, port)| (pid, port))?;
+
+    let mine = listening[&pid].binds_on(port);
+    let other_pids: Vec<u32> =
+        listening.iter().filter(|(p, l)| **p != pid && l.ports().any(|x| x == port)).map(|(p, _)| *p).collect();
+    let others: Vec<Bind> = other_pids.iter().flat_map(|p| listening[p].binds_on(port)).collect();
+    let shared_with = other_pids
+        .iter()
+        .map(|p| who(&listening[p].command, cwds.get(p).map(PathBuf::as_path)))
+        .min();
+    Some(LocalPage { url: format!("http://{}:{port}", url_host(&mine, &others)), shared_with })
 }
 
-/// pid -> (command name, TCP ports it listens on).
-pub(crate) fn listening_ports() -> HashMap<u32, (String, Vec<u16>)> {
-    let mut map: HashMap<u32, (String, Vec<u16>)> = HashMap::new();
-    let Ok(output) = Command::new("lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]).stderr(Stdio::null()).output()
+/// "command (folder)" for the first of `pids`, for notices.
+fn describe(listening: &HashMap<u32, Listener>, pids: &[u32]) -> Option<String> {
+    let cwds = process_cwds(pids);
+    pids.iter().map(|p| who(&listening[p].command, cwds.get(p).map(PathBuf::as_path))).min()
+}
+
+/// "node (site-b)": a process's command and the folder it runs in.
+pub(crate) fn who(command: &str, cwd: Option<&Path>) -> String {
+    match cwd.and_then(|c| c.file_name()).map(|n| n.to_string_lossy()) {
+        Some(folder) if !folder.is_empty() => format!("{command} ({folder})"),
+        _ => command.to_string(),
+    }
+}
+
+/// The address a TCP listener is bound to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Bind {
+    V4Loopback,
+    V6Loopback,
+    V4Any,
+    V6Any,
+    Other,
+}
+
+/// A process's command name and the TCP ports it listens on.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Listener {
+    pub command: String,
+    pub binds: Vec<(u16, Bind)>,
+}
+
+impl Listener {
+    /// Its ports, each once.
+    pub fn ports(&self) -> impl Iterator<Item = u16> + '_ {
+        self.binds.iter().enumerate().filter(|(i, (p, _))| !self.binds[..*i].iter().any(|(q, _)| q == p)).map(|(_, (p, _))| *p)
+    }
+
+    fn binds_on(&self, port: u16) -> Vec<Bind> {
+        self.binds.iter().filter(|(p, _)| *p == port).map(|(_, b)| *b).collect()
+    }
+}
+
+/// The host to put in a URL so it reaches the process bound as `mine`, when
+/// `others` are bound to the same port on other addresses. Browsers try ::1
+/// first for `localhost`, and a loopback bind beats a wildcard one, so
+/// `localhost` is only safe when nobody else has the port.
+fn url_host(mine: &[Bind], others: &[Bind]) -> &'static str {
+    if others.is_empty() {
+        return "localhost";
+    }
+    if mine.contains(&Bind::V4Loopback) || (mine.contains(&Bind::V4Any) && !others.contains(&Bind::V4Loopback)) {
+        "127.0.0.1"
+    } else if mine.contains(&Bind::V6Loopback) || (mine.contains(&Bind::V6Any) && !others.contains(&Bind::V6Loopback)) {
+        "[::1]"
+    } else {
+        "localhost"
+    }
+}
+
+/// pid -> its command name and the TCP ports it listens on.
+pub(crate) fn listening_ports() -> HashMap<u32, Listener> {
+    let Ok(output) = Command::new("lsof").args(["-nP", "-iTCP", "-sTCP:LISTEN", "-Fpctn"]).stderr(Stdio::null()).output()
     else {
-        return map;
+        return HashMap::new();
     };
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_listeners(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Listeners from `lsof -Fpctn` output: a `p` (pid) and `c` (command) line
+/// per process, then `t` (IPv4/IPv6) and `n` (address:port) lines per socket.
+fn parse_listeners(text: &str) -> HashMap<u32, Listener> {
+    let mut map: HashMap<u32, Listener> = HashMap::new();
     let mut pid = None;
+    let mut ipv6 = false;
     for line in text.lines() {
         let (tag, value) = line.split_at(line.len().min(1));
         match tag {
@@ -232,14 +353,23 @@ pub(crate) fn listening_ports() -> HashMap<u32, (String, Vec<u16>)> {
             }
             "c" => {
                 if let Some(entry) = pid.and_then(|p| map.get_mut(&p)) {
-                    entry.0 = value.to_string();
+                    entry.command = value.to_string();
                 }
             }
+            "t" => ipv6 = value == "IPv6",
             "n" => {
-                let port = value.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-                if let (Some(entry), Some(port)) = (pid.and_then(|p| map.get_mut(&p)), port) {
-                    if !entry.1.contains(&port) {
-                        entry.1.push(port);
+                let Some((host, port)) = value.rsplit_once(':') else { continue };
+                let bind = match host {
+                    "*" if ipv6 => Bind::V6Any,
+                    "*" | "0.0.0.0" => Bind::V4Any,
+                    "[::]" => Bind::V6Any,
+                    "[::1]" => Bind::V6Loopback,
+                    h if h.starts_with("127.") => Bind::V4Loopback,
+                    _ => Bind::Other,
+                };
+                if let (Some(entry), Ok(port)) = (pid.and_then(|p| map.get_mut(&p)), port.parse::<u16>()) {
+                    if !entry.binds.contains(&(port, bind)) {
+                        entry.binds.push((port, bind));
                     }
                 }
             }
@@ -250,7 +380,7 @@ pub(crate) fn listening_ports() -> HashMap<u32, (String, Vec<u16>)> {
 }
 
 /// Every process below `root` in the process tree.
-fn descendants_of(root: u32) -> HashSet<u32> {
+pub(crate) fn descendants_of(root: u32) -> HashSet<u32> {
     let mut found = HashSet::new();
     let Ok(output) = Command::new("ps").args(["-axo", "pid=,ppid="]).stderr(Stdio::null()).output() else {
         return found;
@@ -393,7 +523,43 @@ pub fn open_in_simulator(app: &Path, udid: &str, url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_devices;
+    use super::{Bind, LocalPage, parse_devices, parse_listeners, port_of, url_host};
+
+    #[test]
+    fn keeps_the_address_each_listener_is_bound_to() {
+        // The clash from ISSUES.md: site-b on [::1]:4321, Docker on *:4321.
+        let lsof = "p65164\ncnode\nf23\ntIPv6\nn[::1]:4321\np97352\nccom.docke\nf101\ntIPv4\nn*:4321\nf102\ntIPv6\nn*:4321\nf103\ntIPv4\nn127.0.0.1:8025\n";
+        let map = parse_listeners(lsof);
+        assert_eq!(map[&65164].command, "node");
+        assert_eq!(map[&65164].binds, [(4321, Bind::V6Loopback)]);
+        assert_eq!(map[&97352].binds, [(4321, Bind::V4Any), (4321, Bind::V6Any), (8025, Bind::V4Loopback)]);
+        assert_eq!(map[&97352].ports().collect::<Vec<_>>(), [4321, 8025]);
+    }
+
+    #[test]
+    fn url_host_reaches_the_chosen_process() {
+        use Bind::*;
+        // Alone on the port: localhost is fine.
+        assert_eq!(url_host(&[V4Loopback], &[]), "localhost");
+        // site-b on [::1], Docker on every address.
+        assert_eq!(url_host(&[V6Loopback], &[V4Any, V6Any]), "[::1]");
+        // Docker's wildcard bind, with site-b's [::1] capturing localhost.
+        assert_eq!(url_host(&[V4Any, V6Any], &[V6Loopback]), "127.0.0.1");
+        assert_eq!(url_host(&[V4Loopback], &[V6Loopback]), "127.0.0.1");
+        // A wildcard loses to a loopback bind on the same family.
+        assert_eq!(url_host(&[V4Any, V6Any], &[V4Loopback]), "[::1]");
+        assert_eq!(url_host(&[V4Any], &[V4Loopback]), "localhost");
+    }
+
+    #[test]
+    fn notes_who_shares_the_port() {
+        assert_eq!(port_of("http://127.0.0.1:4321"), Some(4321));
+        assert_eq!(port_of("http://[::1]:4321/about"), Some(4321));
+        assert_eq!(port_of("file:///x/index.html"), None);
+        let page = LocalPage { url: "http://[::1]:4321".into(), shared_with: Some("com.docke".into()) };
+        assert_eq!(page.shared_note(), " Port 4321 is also used by com.docke.");
+        assert_eq!(LocalPage { url: "http://localhost:3000".into(), shared_with: None }.shared_note(), "");
+    }
 
     fn device(udid: &str, name: &str, state: &str) -> serde_json::Value {
         serde_json::json!({ "udid": udid, "name": name, "state": state })

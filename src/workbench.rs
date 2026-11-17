@@ -27,11 +27,12 @@ use crate::{
     glass,
     catalog::{self, ThemeChoice},
     usage::{self, Usage},
+    sync,
     settings::{Settings, ThemeSetting},
     terminal::{SessionEvent, TerminalSession},
     text_field::{TextField, TextFieldEvent},
     theme::{self, Theme},
-    webserver::{self, Log, Project, ServerProcess, StaticServer},
+    webserver::{self, ComposePort, Log, Project, ServerProcess, StaticServer},
     worktree::{self, Cleanup, Workspace},
 };
 
@@ -150,8 +151,12 @@ struct ServerRun {
     /// The framework's usual port and who holds it, when we had to move.
     port_owner: Option<(u16, String)>,
     pages: Vec<String>,
+    /// The ports the folder's Docker Compose services publish, when that's
+    /// what was found running. `port` and `url` are then the primary one's.
+    services: Vec<ComposePort>,
     phase: ServerPhase,
-    /// Found already running (not started by Claude Deck): no Stop button.
+    /// Found already running (not started by Claude Deck): no Stop button,
+    /// and looked up again each time it's used, since it can stop or move.
     external: bool,
     /// Dialog checkboxes.
     install: bool,
@@ -177,6 +182,7 @@ impl ServerRun {
             url: String::new(),
             port_owner: None,
             pages: Vec::new(),
+            services: Vec::new(),
             phase: ServerPhase::Checking,
             external: false,
             install: true,
@@ -209,6 +215,13 @@ impl ServerRun {
         Ok(())
     }
 
+    fn process_pid(&self) -> Option<u32> {
+        match &self.handle {
+            Some(ServerHandle::Process(p)) => Some(p.pid()),
+            _ => None,
+        }
+    }
+
     fn process_exited(&mut self) -> Option<bool> {
         match &mut self.handle {
             Some(ServerHandle::Process(p)) => p.exited(),
@@ -221,6 +234,10 @@ impl ServerRun {
 enum ServerFound {
     /// A server for the session is already running.
     Running { url: String, project: Option<Project>, pages: Vec<String> },
+    /// The folder's Docker Compose services are running.
+    Compose { services: Vec<ComposePort> },
+    /// The folder has a Compose file, but none of its services are running.
+    ComposeStopped,
     Project { project: Project, port: u16, port_owner: Option<String>, pages: Vec<String> },
     Nothing(String),
 }
@@ -230,8 +247,17 @@ impl ServerFound {
     fn look(pid: Option<u32>, dir: &Path) -> Self {
         let project = webserver::detect(dir);
         let pages = project.as_ref().map(webserver::pages).unwrap_or_else(|_| vec!["/".into()]);
-        if let Some(url) = browser::find_local_page(pid, dir).filter(|u| u.starts_with("http")) {
-            return ServerFound::Running { url, project: project.ok(), pages };
+        if let Some(page) = browser::find_server(pid, dir) {
+            return ServerFound::Running { url: page.url, project: project.ok(), pages };
+        }
+        let services = webserver::compose_services(dir);
+        if !services.is_empty() {
+            return ServerFound::Compose { services };
+        }
+        // A Compose project isn't a folder of static HTML to serve, even if
+        // it has some (generated output, say).
+        if webserver::has_compose_file(dir) && project.as_ref().map_or(true, Project::is_static) {
+            return ServerFound::ComposeStopped;
         }
         match project {
             Err(why) => ServerFound::Nothing(why),
@@ -314,6 +340,128 @@ pub struct Workbench {
     _usage_refresh: Task<()>,
     asana: AsanaPanel,
     _asana_refresh: Task<()>,
+    /// What's still loading at launch; the loader covers the window until
+    /// it's all in (or `STARTUP_LIMIT` passes).
+    startup: Startup,
+    _startup_limit: Task<()>,
+    /// Commits to push or pull per window folder, for the branch badge.
+    sync: HashMap<PathBuf, sync::SyncStatus>,
+    /// Asks the sync loop to look again now; `true` also fetches.
+    sync_tx: smol::channel::Sender<bool>,
+    _sync_refresh: Task<()>,
+}
+
+/// Launch work the window waits for before it's usable. Each part runs in
+/// the background; on a cold start (after a reboot or an update) the login
+/// shell that finds `claude`, `claude auth status` for each account, the
+/// first trace of each app icon and the VS Code theme scan can each take
+/// seconds, and until they finish the window shows "Checking…" accounts and
+/// buttons that pop in later, which looks stuck.
+#[derive(Default)]
+struct Startup {
+    accounts: bool,
+    themes: bool,
+    apps: bool,
+    /// The user chose to skip the wait.
+    skipped: bool,
+    /// `STARTUP_LIMIT` passed.
+    timed_out: bool,
+}
+
+impl Startup {
+    fn ready(&self) -> bool {
+        self.skipped || self.timed_out || (self.accounts && self.themes && self.apps)
+    }
+}
+
+/// Longest the loader waits for launch work before showing the app anyway.
+const STARTUP_LIMIT: Duration = Duration::from_secs(15);
+/// When the loader offers to skip the wait.
+const STARTUP_SKIP_AFTER: Duration = Duration::from_secs(4);
+/// How often the branch badges' push/pull counts are re-read from local refs.
+const SYNC_TICK: Duration = Duration::from_secs(15);
+/// How often each folder's remote is fetched for those counts.
+const SYNC_FETCH_EVERY: Duration = Duration::from_secs(300);
+
+/// A charge code section being dragged to a new place in the list.
+#[derive(Clone)]
+struct DragSection(usize);
+
+/// A charge code being dragged: (section, index in it).
+#[derive(Clone)]
+struct DragCode(usize, usize);
+
+/// What follows the pointer while a section or code is dragged.
+struct DragPreview {
+    label: SharedString,
+    /// Background, text, border.
+    colors: (Hsla, Hsla, Hsla),
+    bold: bool,
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (bg, fg, border) = self.colors;
+        div()
+            .w(px(240.))
+            .h(px(26.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(4.))
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .shadow_md()
+            .opacity(0.92)
+            .text_color(fg)
+            .text_size(px(13.))
+            .font_family(".SystemUIFont")
+            .font_weight(if self.bold { gpui::FontWeight::BOLD } else { gpui::FontWeight::MEDIUM })
+            .child(icon("grip", 12., fg.opacity(0.6)))
+            .child(div().flex_1().min_w(px(0.)).truncate().child(self.label.clone()))
+    }
+}
+
+/// Move `from` to `to` in a list: the item lands where the drop target was,
+/// so dragging down puts it after the target and dragging up before it.
+fn move_item<T>(list: &mut Vec<T>, from: usize, to: usize) -> bool {
+    if from == to || from >= list.len() || to >= list.len() {
+        return false;
+    }
+    let item = list.remove(from);
+    list.insert(to, item);
+    true
+}
+
+fn plural(n: u32) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// A plain text tooltip.
+struct Tip {
+    text: SharedString,
+    /// Background, text, border.
+    colors: (Hsla, Hsla, Hsla),
+}
+
+impl Render for Tip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (bg, fg, border) = self.colors;
+        div()
+            .max_w(px(280.))
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(4.))
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .text_color(fg)
+            .text_size(px(12.))
+            .font_family(".SystemUIFont")
+            .child(self.text.clone())
+    }
 }
 
 const WARNING: Hsla = Hsla { h: 0.11, s: 0.9, l: 0.55, a: 1. };
@@ -322,11 +470,13 @@ fn icon(name: &str, size: f32, color: Hsla) -> gpui::Svg {
     svg().path(SharedString::from(format!("icons/{name}.svg"))).size(px(size)).flex_none().text_color(color)
 }
 
-/// The activity bar's own icons: VTracer traces (see src/vector.rs).
+/// The activity bar's Claude icon: a VTracer trace (see src/vector.rs).
 static CLAUDE_ICON: LazyLock<Arc<gpui::Image>> =
     LazyLock::new(|| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, crate::vector::CLAUDE_SVG.to_vec())));
-static COLOR_BARS_ICON: LazyLock<Arc<gpui::Image>> =
-    LazyLock::new(|| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, crate::vector::COLOR_BARS_SVG.to_vec())));
+/// The Themes view: four squares in the primary colors (red, yellow, blue, green).
+static THEME_COLORS_ICON: LazyLock<Arc<gpui::Image>> = LazyLock::new(|| {
+    Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, include_bytes!("../assets/icons/theme-colors.svg").to_vec()))
+});
 /// The Asana mark at the top of the Asana panel, in its own colors.
 static ASANA_LOGO: LazyLock<Arc<gpui::Image>> =
     LazyLock::new(|| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Svg, asana::LOGO_SVG.to_vec())));
@@ -531,6 +681,7 @@ impl Workbench {
             let found = cx.background_executor().spawn(async { catalog::scan() }).await;
             let _ = this.update(cx, |this, cx| {
                 this.themes = found;
+                this.startup.themes = true;
                 cx.notify();
             });
         })
@@ -567,6 +718,10 @@ impl Workbench {
                     .await;
                 known = seen;
                 let updated = this.update(cx, |this, cx| {
+                    if !this.startup.accounts {
+                        this.startup.accounts = true;
+                        cx.notify();
+                    }
                     if this.accounts != found {
                         this.accounts = found;
                         this.warn_shared_logins(cx);
@@ -590,6 +745,7 @@ impl Workbench {
             let _ = this.update(cx, |this, cx| {
                 this.ghostty_icon = ghostty;
                 this.browsers = browsers;
+                this.startup.apps = true;
                 cx.notify();
             });
         })
@@ -631,6 +787,73 @@ impl Workbench {
             cx.background_executor().timer(Duration::from_secs(30)).await;
         });
 
+        let startup_limit = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(STARTUP_LIMIT).await;
+            let _ = this.update(cx, |this, cx| {
+                this.startup.timed_out = true;
+                cx.notify();
+            });
+        });
+
+        // Push/pull counts for every window's branch: local refs every
+        // SYNC_TICK, a quiet `git fetch` per folder every SYNC_FETCH_EVERY
+        // (or when asked), all in the background.
+        let (sync_tx, sync_rx) = smol::channel::unbounded::<bool>();
+        let sync_refresh = cx.spawn(async move |this, cx| {
+            let mut fetched: HashMap<PathBuf, Instant> = HashMap::new();
+            let mut fetch_now = false;
+            loop {
+                let Ok(folders) = this.update(cx, |this, cx| {
+                    let mut folders: Vec<(PathBuf, Option<GitIdentity>)> = Vec::new();
+                    for s in &this.sessions {
+                        let s = s.read(cx);
+                        if !folders.iter().any(|(d, _)| d == &s.workspace.cwd) {
+                            folders.push((s.workspace.cwd.clone(), s.git.clone()));
+                        }
+                    }
+                    folders
+                }) else {
+                    break;
+                };
+                fetched.retain(|d, _| folders.iter().any(|(f, _)| f == d));
+                let due: Vec<bool> = folders
+                    .iter()
+                    .map(|(d, _)| fetch_now || fetched.get(d).is_none_or(|t| t.elapsed() >= SYNC_FETCH_EVERY))
+                    .collect();
+                for ((dir, _), due) in folders.iter().zip(&due) {
+                    if *due {
+                        fetched.insert(dir.clone(), Instant::now());
+                    }
+                }
+                let found = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut found = HashMap::new();
+                        for ((dir, git), due) in folders.into_iter().zip(due) {
+                            if due {
+                                sync::fetch(&dir, git.as_ref());
+                            }
+                            if let Some(status) = sync::status(&dir) {
+                                found.insert(dir, status);
+                            }
+                        }
+                        found
+                    })
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    if this.sync != found {
+                        this.sync = found;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+                let timer = cx.background_executor().timer(SYNC_TICK);
+                fetch_now = smol::future::or(async { timer.await; false }, async { sync_rx.recv().await.unwrap_or(false) }).await;
+            }
+        });
+
         Self {
             sessions: Vec::new(),
             session_subscriptions: HashMap::new(),
@@ -665,6 +888,11 @@ impl Workbench {
             _usage_refresh: usage_refresh,
             asana: AsanaPanel { config: asana::load_config(), ..Default::default() },
             _asana_refresh: asana_refresh,
+            startup: Startup::default(),
+            _startup_limit: startup_limit,
+            sync: HashMap::new(),
+            sync_tx,
+            _sync_refresh: sync_refresh,
             folder_logins: HashMap::new(),
             ghostty_icon: None,
             browsers: Vec::new(),
@@ -752,12 +980,14 @@ impl Workbench {
             self.notify(NoticeKind::Info, "Open a Claude session first; its local page opens in the browser.", cx);
             return;
         };
-        // A server from the webserver button wins: its URL is exact (and
+        // A server the webserver button started wins: its URL is exact (and
         // Claude Deck's own static server isn't found by process lookup).
+        // One it only found running is looked up afresh: it may have stopped
+        // since, and another project's server taken its port.
         let known = self
             .servers
             .get(&session.entity_id())
-            .filter(|r| r.phase == ServerPhase::Ready)
+            .filter(|r| r.phase == ServerPhase::Ready && !r.external && !r.url.is_empty())
             .map(|r| r.url.clone());
         let (pid, dir) = {
             let s = session.read(cx);
@@ -769,8 +999,8 @@ impl Workbench {
                 .spawn({
                     let label = label.clone();
                     async move {
-                        let url = match known {
-                            Some(url) => url,
+                        let page = match known {
+                            Some(url) => browser::LocalPage { url, shared_with: None },
                             None => browser::find_local_page(pid, &dir).ok_or_else(|| {
                                 format!(
                                     "No local server is running for {}, and it has no index.html. The webserver button can start one.",
@@ -778,13 +1008,15 @@ impl Workbench {
                                 )
                             })?,
                         };
-                        open(&url).map_err(|e| format!("Couldn't open {label}: {e}"))?;
-                        Ok::<_, String>(url)
+                        open(&page.url).map_err(|e| format!("Couldn't open {label}: {e}"))?;
+                        Ok::<_, String>(page)
                     }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| match result {
-                Ok(url) => this.notify(NoticeKind::Info, format!("Opened {url} in {label}"), cx),
+                Ok(page) => {
+                    this.notify(NoticeKind::Info, format!("Opened {} in {label}.{}", page.url, page.shared_note()), cx)
+                }
                 Err(e) => this.notify(NoticeKind::Warning, e, cx),
             });
         })
@@ -1015,7 +1247,17 @@ impl Workbench {
     /// GitHub identity a window uses unless overridden: the one its folder
     /// points at, else its Claude account's default.
     fn git_for(&self, account: &Account, cwd: &Path) -> Option<GitIdentity> {
-        self.folder_git(cwd).or_else(|| self.settings.git_for_email(&self.email_of(account)?)).cloned()
+        let git = self.folder_git(cwd).or_else(|| self.settings.git_for_email(&self.email_of(account)?)).cloned();
+        git.map(|g| self.with_repo_author(g, cwd))
+    }
+
+    /// `git` with the commit author the folder's repo sets for itself, if
+    /// it sets one.
+    fn with_repo_author(&self, git: GitIdentity, cwd: &Path) -> GitIdentity {
+        match self.folder_logins.get(cwd) {
+            Some(logins) => git.for_repo(logins),
+            None => git,
+        }
     }
 
     /// The identity a window's folder points at, from the logins looked up
@@ -1049,6 +1291,7 @@ impl Workbench {
         self.session_subscriptions.insert(session.entity_id(), subscription);
         self.sessions.push(session.clone());
         self.activate(&session, window, cx);
+        let _ = self.sync_tx.try_send(false);
         session
     }
 
@@ -1496,7 +1739,8 @@ impl Workbench {
     fn request_git_switch(&mut self, id: EntityId, github_user: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.close_menus(cx);
         let Some(session) = self.sessions.iter().find(|s| s.entity_id() == id).cloned() else { return };
-        let git = github_user.and_then(|u| self.settings.git_identity(&u).cloned());
+        let cwd = session.read(cx).workspace.cwd.clone();
+        let git = github_user.and_then(|u| self.settings.git_identity(&u).cloned()).map(|g| self.with_repo_author(g, &cwd));
         if session.read(cx).git == git {
             return;
         }
@@ -1916,6 +2160,43 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Indexes change under a drag: drop an open edit and the copied mark.
+    fn after_charge_move(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.copied = None;
+        charge_codes::save(&self.charge_codes);
+        cx.notify();
+    }
+
+    fn move_section(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if move_item(&mut self.charge_codes, from, to) {
+            self.after_charge_move(cx);
+        }
+    }
+
+    /// Move a code to `to` (section, index), or to the end of section `to.0`
+    /// when the index is None. Works across sections.
+    fn move_code(&mut self, from: (usize, usize), to: (usize, Option<usize>), cx: &mut Context<Self>) {
+        let (fi, fj) = from;
+        let (ti, tj) = to;
+        let sections = &mut self.charge_codes;
+        if fi >= sections.len() || ti >= sections.len() || fj >= sections[fi].codes.len() {
+            return;
+        }
+        if fi == ti {
+            let last = sections[fi].codes.len() - 1;
+            if !move_item(&mut sections[fi].codes, fj, tj.unwrap_or(last)) {
+                return;
+            }
+        } else {
+            let code = sections[fi].codes.remove(fj);
+            let codes = &mut sections[ti].codes;
+            let at = tj.unwrap_or(codes.len()).min(codes.len());
+            codes.insert(at, code);
+        }
+        self.after_charge_move(cx);
+    }
+
     fn request_delete_section(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(section) = self.charge_codes.get(i) else { return };
         if section.codes.is_empty() {
@@ -2101,7 +2382,7 @@ impl Workbench {
             .border_r_1()
             .border_color(t.border)
             .child(item("act-sessions", &CLAUDE_ICON, SidebarView::Sessions, Some(self.sessions.len()), cx))
-            .child(item("act-themes", &COLOR_BARS_ICON, SidebarView::Themes, None, cx))
+            .child(item("act-themes", &THEME_COLORS_ICON, SidebarView::Themes, None, cx))
             .child(div().mx(px(12.)).my(px(4.)).h(px(1.)).bg(t.border))
             .child(
                 div()
@@ -2755,6 +3036,15 @@ impl Workbench {
                     .on_click(cx.listener(move |this, _, w, cx| this.request_git_switch(id, user.clone(), w, cx))),
             );
         }
+        // The repo's own author wins over the account's name and email.
+        if let Some(author) = self.folder_logins.get(&s.workspace.cwd).and_then(FolderLogins::author) {
+            menu = menu.child(div().my(px(4.)).h(px(1.)).bg(t.border)).child(
+                div().w_full().px(px(12.)).py(px(4.)).text_size(px(12.)).text_color(t.fg_muted).child(format!(
+                    "Commits in this folder are authored as {author}, which its own git config sets. \
+                     The account above is used to push."
+                )),
+            );
+        }
         menu
     }
 
@@ -3118,10 +3408,12 @@ impl Workbench {
         let (sid, label) = (s.id, s.label());
         // With a GitHub `origin`, the badge links to the branch on github.com.
         let linked = self.folder_logins.get(&s.workspace.cwd).is_some_and(|l| l.web.is_some());
+        let sync_status = self.sync.get(&s.workspace.cwd).copied();
         let picker = self.github_sign_in.as_ref().filter(|p| p.session == id).map(|p| self.render_github_sign_in(p, t, cx));
         let chip = self.render_account_chip(session, t, cx);
         let theme_button = self.render_theme_button(session, t, cx);
         let git_chip = self.render_git_chip(session, t, cx);
+        let sync_badge = sync_status.map(|st| self.render_sync_badge(sid, st, t, cx));
         div()
             .id(("pane-header", sid))
             .relative()
@@ -3177,6 +3469,7 @@ impl Workbench {
                         ))
                     }),
             )
+            .children(sync_badge)
             .child(div().flex_1())
             .child(theme_button)
             .child(git_chip)
@@ -3196,6 +3489,55 @@ impl Workbench {
                     })),
             )
             .on_click(cx.listener(move |this, _, w, cx| this.activate_id(id, w, cx)))
+    }
+
+    /// Beside the branch badge: ↑N commits to push and ↓N to pull, or a
+    /// check when the branch matches its upstream. Clicking fetches now.
+    fn render_sync_badge(&self, sid: usize, st: sync::SyncStatus, t: &Theme, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let push = brand_orange();
+        let pull = t.focus_border;
+        let tip: SharedString = match (st.ahead, st.behind, st.has_upstream) {
+            (0, 0, true) => "Up to date with the remote branch. Click to check again.".into(),
+            (0, 0, false) => "This branch isn't on the remote yet, and has nothing new to push.".into(),
+            (a, 0, false) => format!("{a} commit{} not pushed yet (the branch isn't on the remote). Click to check again.", plural(a)).into(),
+            (a, b, _) => {
+                let mut parts = Vec::new();
+                if a > 0 {
+                    parts.push(format!("{a} commit{} to push", plural(a)));
+                }
+                if b > 0 {
+                    parts.push(format!("{b} to pull"));
+                }
+                format!("{}. Click to check again.", parts.join(", ")).into()
+            }
+        };
+        let tip_colors = (t.sidebar_bg, t.fg, t.border);
+        div()
+            .id(("pane-sync", sid))
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .px(px(5.))
+            .h(px(16.))
+            .rounded(px(8.))
+            .text_size(px(11.))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .cursor_pointer()
+            .hover(|s| s.bg(t.badge_bg.opacity(0.5)))
+            .map(|d| {
+                if st.ahead == 0 && st.behind == 0 {
+                    d.child(icon("check", 11., if st.has_upstream { t.success_fg } else { t.fg_muted }))
+                } else {
+                    d.when(st.ahead > 0, |d| d.child(div().text_color(push).child(format!("↑{}", st.ahead))))
+                        .when(st.behind > 0, |d| d.child(div().text_color(pull).child(format!("↓{}", st.behind))))
+                }
+            })
+            .tooltip(move |_, cx| cx.new(|_| Tip { text: tip.clone(), colors: tip_colors }).into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                let _ = this.sync_tx.try_send(true);
+            }))
     }
 
     fn render_exit_bar(&self, session: &Entity<TerminalSession>, t: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -4033,6 +4375,21 @@ impl Workbench {
         // Icon buttons sit on rows that already show the hover color.
         let hover_strong = t.fg.opacity(0.15);
         let field_row = |field: Entity<TextField>| div().px(px(12.)).py(px(3.)).child(field);
+        let drop_line = t.focus_border;
+        let preview_colors = (t.sidebar_bg, t.sidebar_fg, t.focus_border);
+        // Shown on hover: a grip to drag the row by (the whole row drags).
+        let grip = |group: SharedString| {
+            div()
+                .absolute()
+                .left(px(4.))
+                .top_0()
+                .bottom_0()
+                .flex()
+                .items_center()
+                .invisible()
+                .group_hover(group, |st| st.visible())
+                .child(icon("grip", 12., t.fg_muted))
+        };
         let mut list = div().id("charge-codes").flex_1().min_h(px(0.)).overflow_y_scroll().flex().flex_col().pb(px(8.));
 
         if self.charge_codes.is_empty() && self.editing(EditTarget::NewSection).is_none() {
@@ -4051,17 +4408,43 @@ impl Workbench {
 
         for (i, section) in self.charge_codes.iter().enumerate() {
             // Sections are divided by a line.
-            let mut block = div().flex().flex_col().py(px(6.)).when(i > 0, |d| d.border_t_1().border_color(t.border));
+            // The whole section is a drop target for a dragged section; a
+            // line shows which side of it the dragged one will land on.
+            let mut block = div()
+                .id(SharedString::from(format!("cc-block-{i}")))
+                .flex()
+                .flex_col()
+                .py(px(6.))
+                .when(i > 0, |d| d.border_t_1().border_color(t.border))
+                .drag_over::<DragSection>(move |st, d, _, _| {
+                    if d.0 < i {
+                        st.border_b_2().border_color(drop_line)
+                    } else if d.0 > i {
+                        st.border_t_2().border_color(drop_line)
+                    } else {
+                        st
+                    }
+                })
+                .on_drop(cx.listener(move |this, d: &DragSection, _, cx| this.move_section(d.0, i, cx)));
 
             block = match self.editing(EditTarget::SectionTitle(i)) {
                 Some(field) => block.child(field_row(field)),
                 None => {
                     let group = SharedString::from(format!("cc-section-{i}"));
                     let title = section.title.clone();
+                    let label: SharedString = section.title.clone().into();
                     block.child(
                         div()
                             .id(group.clone())
                             .group(group.clone())
+                            .relative()
+                            .child(grip(group.clone()))
+                            .on_drag(DragSection(i), move |_, _, _, cx| {
+                                cx.new(|_| DragPreview { label: label.clone(), colors: preview_colors, bold: true })
+                            })
+                            // A code dropped on a title goes first in that section.
+                            .drag_over::<DragCode>(move |st, _, _, _| st.border_t_2().border_color(drop_line))
+                            .on_drop(cx.listener(move |this, d: &DragCode, _, cx| this.move_code((d.0, d.1), (i, Some(0)), cx)))
                             .h(px(26.))
                             .pl(px(20.))
                             .pr(px(8.))
@@ -4102,10 +4485,26 @@ impl Workbench {
                 let group = SharedString::from(format!("cc-code-{i}-{j}"));
                 let copied = self.copied == Some((i, j));
                 let value = code.clone();
+                let label: SharedString = code.clone().into();
                 block = block.child(
                     div()
                         .id(group.clone())
                         .group(group.clone())
+                        .relative()
+                        .child(grip(group.clone()))
+                        .on_drag(DragCode(i, j), move |_, _, _, cx| {
+                            cx.new(|_| DragPreview { label: label.clone(), colors: preview_colors, bold: false })
+                        })
+                        .drag_over::<DragCode>(move |st, d, _, _| {
+                            if d.0 == i && d.1 < j {
+                                st.border_b_2().border_color(drop_line)
+                            } else if d.0 == i && d.1 == j {
+                                st
+                            } else {
+                                st.border_t_2().border_color(drop_line)
+                            }
+                        })
+                        .on_drop(cx.listener(move |this, d: &DragCode, _, cx| this.move_code((d.0, d.1), (i, Some(j)), cx)))
                         .h(px(24.))
                         .pl(px(20.))
                         .pr(px(8.))
@@ -4154,6 +4553,9 @@ impl Workbench {
                 None => block.child(
                     div()
                         .id(SharedString::from(format!("cc-add-code-{i}")))
+                        // A code dropped here goes last in this section.
+                        .drag_over::<DragCode>(move |st, _, _, _| st.border_t_2().border_color(drop_line))
+                        .on_drop(cx.listener(move |this, d: &DragCode, _, cx| this.move_code((d.0, d.1), (i, None), cx)))
                         .h(px(24.))
                         .pl(px(20.))
                         .flex()
@@ -4181,6 +4583,96 @@ impl Workbench {
             );
         }
         list
+    }
+
+    /// Covers the window while launch work finishes (see `Startup`), listing
+    /// what it's waiting for, so a slow cold start reads as loading rather
+    /// than stuck. After `STARTUP_SKIP_AFTER` it offers to go on anyway.
+    fn render_loader(&self, t: &Theme, glass: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let orange = brand_orange();
+        let waited = self.opened_at.elapsed();
+        let step = |key: &'static str, label: &'static str, done: bool| {
+            let mark = if done {
+                icon("check", 13., t.success_fg).into_any_element()
+            } else {
+                icon("restart", 13., orange)
+                    .with_animation(key, Animation::new(Duration::from_millis(900)).repeat(), |s, d| {
+                        s.with_transformation(Transformation::rotate(radians(d * std::f32::consts::TAU)))
+                    })
+                    .into_any_element()
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_color(if done { t.fg } else { t.fg_muted })
+                .child(mark)
+                .child(label)
+        };
+        let s = &self.startup;
+        // Decode the activity bar's and panels' images now, so they're
+        // there when the app appears instead of popping in after.
+        let warm = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size(px(1.))
+            .overflow_hidden()
+            .opacity(0.)
+            .children([&*CLAUDE_ICON, &*THEME_COLORS_ICON, &*ASANA_LOGO].map(|i| img(i.clone()).size(px(24.))));
+        div()
+            .id("loader")
+            .relative()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .when(!glass, |d| d.bg(t.editor_bg))
+            .text_color(t.fg)
+            .font_family(".SystemUIFont")
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(13.))
+            .child(warm)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(18.))
+                    .child(img(WELCOME_ICON.clone()).size(px(96.)).flex_none())
+                    .child(div().text_size(px(20.)).child("Claude Deck"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .text_size(px(12.))
+                            .child(step("loader-accounts", "Finding Claude Code and checking accounts", s.accounts))
+                            .child(step("loader-themes", "Loading themes", s.themes))
+                            .child(step("loader-apps", "Finding browsers and apps", s.apps)),
+                    )
+                    .child(
+                        div()
+                            .id("loader-skip")
+                            .h(px(18.))
+                            .text_size(px(12.))
+                            .text_color(t.button_bg)
+                            .when(waited >= STARTUP_SKIP_AFTER, |d| {
+                                d.cursor_pointer().hover(|s| s.underline()).child("Continue without waiting").on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.startup.skipped = true;
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                    )
+                    // Fast launches are done before this shows, so they don't flash.
+                    .with_animation(
+                        "loader-fade",
+                        Animation::new(Duration::from_millis(500)).with_easing(ease_out_quint()),
+                        |el, d| el.opacity(((d - 0.4) / 0.6).max(0.)),
+                    ),
+            )
     }
 
     fn render_status_bar(&self, t: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4270,10 +4762,20 @@ impl Workbench {
             return;
         };
         let id = session.entity_id();
-        if self.servers.contains_key(&id) {
-            self.server_panel = if self.server_panel == Some(id) { None } else { Some(id) };
-            cx.notify();
-            return;
+        if let Some(run) = self.servers.get(&id) {
+            if self.server_panel == Some(id) {
+                self.server_panel = None;
+                cx.notify();
+                return;
+            }
+            // Show our own server's dialog again. One that was only found
+            // running may have stopped or moved since: look again.
+            if !(run.external && run.phase == ServerPhase::Ready) {
+                self.server_panel = Some(id);
+                cx.notify();
+                return;
+            }
+            self.servers.remove(&id);
         }
         let (pid, dir) = {
             let s = session.read(cx);
@@ -4302,11 +4804,34 @@ impl Workbench {
                 self.notify(NoticeKind::Warning, format!("Nothing to serve in {}. {why}", home_relative(&dir)), cx);
                 return;
             }
+            ServerFound::ComposeStopped => {
+                let dir = run.dir.clone();
+                self.servers.remove(&id);
+                if self.server_panel == Some(id) {
+                    self.server_panel = None;
+                }
+                let message = format!(
+                    "{} runs with Docker Compose. Start it with `docker compose up -d`, then press the button again.",
+                    home_relative(&dir)
+                );
+                self.notify(NoticeKind::Info, message, cx);
+                return;
+            }
             ServerFound::Running { url, project, pages } => {
-                run.port = url.rsplit(':').next().and_then(|p| p.trim_end_matches('/').parse().ok()).unwrap_or(0);
+                run.port = browser::port_of(&url).unwrap_or(0);
                 run.url = url;
                 run.project = project;
                 run.pages = pages;
+                run.external = true;
+                run.phase = ServerPhase::Ready;
+            }
+            ServerFound::Compose { services } => {
+                // The lowest web port is what the browser buttons open.
+                if let Some(primary) = webserver::compose_primary(&services) {
+                    run.port = primary.host_port;
+                    run.url = primary.url();
+                }
+                run.services = services;
                 run.external = true;
                 run.phase = ServerPhase::Ready;
             }
@@ -4367,10 +4892,12 @@ impl Workbench {
                 // can wait up to 150ms) and hand the answer to the check.
                 let probe = this.read_with(cx, |this, _| this.ready_probe(id)).ok().flatten();
                 let ready = match probe {
-                    Some((port, any_loopback)) => {
-                        cx.background_executor().spawn(async move { webserver::is_listening(port, any_loopback) }).await
+                    Some((pid, port, any_loopback, dir)) => {
+                        cx.background_executor()
+                            .spawn(async move { webserver::ready_port(pid, port, any_loopback, &dir) })
+                            .await
                     }
-                    None => false,
+                    None => None,
                 };
                 if !this.update(cx, |this, cx| this.watch_server(id, ready, cx)).unwrap_or(false) {
                     break;
@@ -4380,16 +4907,18 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The port to probe and how, while a session's dev server is starting.
-    fn ready_probe(&self, id: EntityId) -> Option<(u16, bool)> {
+    /// The process and port to probe, and how, while a session's dev server
+    /// is starting.
+    fn ready_probe(&self, id: EntityId) -> Option<(u32, u16, bool, PathBuf)> {
         let run = self.servers.get(&id).filter(|r| r.phase == ServerPhase::Starting)?;
-        Some((run.port, run.project.as_ref()?.ready_on_any_loopback()))
+        let project = run.project.as_ref()?;
+        Some((run.process_pid()?, run.port, project.ready_on_any_loopback(), project.root.clone()))
     }
 
     /// One check of a server process: install finished, dev server
-    /// answering (`ready`, probed off the UI thread), or stopped. Returns
-    /// whether to keep watching.
-    fn watch_server(&mut self, id: EntityId, ready: bool, cx: &mut Context<Self>) -> bool {
+    /// answering (`ready`: the port it answers on, probed off the UI thread),
+    /// or stopped. Returns whether to keep watching.
+    fn watch_server(&mut self, id: EntityId, ready: Option<u16>, cx: &mut Context<Self>) -> bool {
         let Some(run) = self.servers.get_mut(&id) else { return false };
         let generation = run.log.generation();
         let new_output = generation != run.log_seen;
@@ -4414,7 +4943,15 @@ impl Workbench {
             ServerPhase::Starting => {
                 if exited.is_some() {
                     run.phase = ServerPhase::Failed("The dev server stopped before it was ready.".into());
-                } else if ready {
+                } else if let Some(port) = ready {
+                    // The server may have moved off a port someone else took
+                    // just before it started.
+                    if port != run.port {
+                        if let Some(project) = &run.project {
+                            run.url = project.url(port);
+                            run.port = port;
+                        }
+                    }
                     run.phase = ServerPhase::Ready;
                 } else if run.started_at.elapsed() > SERVER_START_TIMEOUT {
                     run.handle = None; // stops it
@@ -4647,11 +5184,14 @@ impl Workbench {
             ServerPhase::NeedsApproval => format!("Start the {tech} dev server?"),
             ServerPhase::Installing => format!("Installing {tech} dependencies…"),
             ServerPhase::Starting => format!("Building {tech}…"),
+            ServerPhase::Ready if !run.services.is_empty() => "Docker Compose is running".to_string(),
             ServerPhase::Ready if run.external => format!("{} is already running", if run.project.is_some() { tech } else { "A server" }),
             ServerPhase::Ready => format!("{tech} is running"),
             ServerPhase::Failed(_) => format!("The {tech} server isn't running"),
         };
         let chip = match &run.project {
+            _ if !run.services.is_empty() && run.port > 0 => format!("Docker · :{}", run.port),
+            _ if !run.services.is_empty() => "Docker".to_string(),
             Some(p) if run.port > 0 => format!("{} · :{}", p.tech_line(), run.port),
             Some(p) => p.tech_line(),
             None if run.port > 0 => format!(":{}", run.port),
@@ -4863,10 +5403,40 @@ impl Workbench {
 
             ServerPhase::Ready => {
                 let base = run.url.trim_end_matches('/').to_string();
+                let compose = !run.services.is_empty();
                 let link_browsers: Vec<&InstalledBrowser> =
                     self.browsers.iter().filter(|b| b.browser != Browser::Simulator).collect();
-                let links = run.pages.iter().enumerate().map(|(i, page)| {
-                    let url = format!("{base}{page}");
+                // One row per page of the server, or per port the Compose
+                // services publish: (label, its URL if it's a web page, and
+                // whether it's the one the browser buttons open).
+                let rows: Vec<(String, Option<String>, bool)> = if compose {
+                    run.services
+                        .iter()
+                        .map(|p| {
+                            let label = format!("{} · :{}", p.service, p.host_port);
+                            (label, p.web.then(|| p.url()), p.web && p.host_port == run.port)
+                        })
+                        .collect()
+                } else {
+                    run.pages.iter().map(|page| (page.clone(), Some(format!("{base}{page}")), true)).collect()
+                };
+                let links = rows.into_iter().enumerate().map(|(i, (label, url, primary))| {
+                    let Some(url) = url else {
+                        // Published, but not a web page (an SMTP port, a database).
+                        return div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .px(px(10.))
+                            .py(px(6.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(faint)
+                            .text_color(muted)
+                            .child(div().size(px(6.)).flex_none().rounded_full().bg(muted))
+                            .child(div().flex_1().min_w(px(0.)).truncate().font_family("Menlo").text_size(px(12.)).child(label))
+                            .child(div().flex_none().text_size(px(11.)).child("not a web page"));
+                    };
                     let open_url = url.clone();
                     div()
                         .flex()
@@ -4888,8 +5458,8 @@ impl Workbench {
                                 .bg(gpui::white().opacity(0.03))
                                 .cursor_pointer()
                                 .hover(move |s| s.bg(gpui::white().opacity(0.09)).border_color(orange))
-                                .child(div().size(px(6.)).flex_none().rounded_full().bg(orange.opacity(0.8)))
-                                .child(div().flex_1().min_w(px(0.)).truncate().font_family("Menlo").text_size(px(12.)).child(page.clone()))
+                                .child(div().size(px(6.)).flex_none().rounded_full().bg(if primary { orange.opacity(0.8) } else { muted }))
+                                .child(div().flex_1().min_w(px(0.)).truncate().font_family("Menlo").text_size(px(12.)).child(label))
                                 .child(div().flex_none().text_color(muted).child("↗"))
                                 .on_click(cx.listener(move |this, _, _, cx| this.open_server_page(open_url.clone(), None, cx))),
                         )
@@ -4921,22 +5491,30 @@ impl Workbench {
                     [one] => format!("The {one} button"),
                     [rest @ .., last] => format!("The {} and {last} buttons", rest.join(", ")),
                 };
-                let mut footer = format!("{tools} in the activity bar now open this server.");
-                if self.browsers.iter().any(|b| b.browser == Browser::Simulator) {
+                let mut footer = if base.is_empty() {
+                    "None of these ports answers as a web page, so the browser buttons have nothing to open.".to_string()
+                } else if compose {
+                    format!("{tools} in the activity bar now open {base}.")
+                } else {
+                    format!("{tools} in the activity bar now open this server.")
+                };
+                if !base.is_empty() && self.browsers.iter().any(|b| b.browser == Browser::Simulator) {
                     footer.push_str(" Device Hub shows it in Safari on an iPhone or iPad simulator.");
                 }
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(10.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.))
-                            .child(div().size(px(8.)).rounded_full().bg(green))
-                            .child(div().font_family("Menlo").text_size(px(12.)).text_color(gpui::white().opacity(0.85)).child(base.clone())),
-                    )
+                    .when(!base.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.))
+                                .child(div().size(px(8.)).rounded_full().bg(green))
+                                .child(div().font_family("Menlo").text_size(px(12.)).text_color(gpui::white().opacity(0.85)).child(base.clone())),
+                        )
+                    })
                     .child(div().id("srv-links").max_h(px(260.)).overflow_y_scroll().flex().flex_col().gap(px(6.)).children(links))
                     .child(
                         div()
@@ -4959,7 +5537,8 @@ impl Workbench {
                             .items_center()
                             .map(|d| {
                                 if run.external {
-                                    d.child(div().text_size(px(11.)).text_color(muted).child("Started outside Claude Deck."))
+                                    let note = if compose { "Started with Docker Compose, outside Claude Deck." } else { "Started outside Claude Deck." };
+                                    d.child(div().text_size(px(11.)).text_color(muted).child(note))
                                 } else {
                                     d.child(log_toggle).child(
                                         button("srv-stop", "Stop server", false, true)
@@ -5077,6 +5656,9 @@ impl Render for Workbench {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let glass = glass::enabled(cx);
         let t = Theme::current(cx);
+        if !self.startup.ready() {
+            return self.render_loader(&t, glass, cx).into_any_element();
+        }
         let editor: AnyElement = if self.sessions.is_empty() {
             self.render_welcome(&t, cx).into_any_element()
         } else if self.layout == Layout::Grid {
@@ -5142,6 +5724,7 @@ impl Render for Workbench {
                     .children(self.render_notice(&t, cx))
                     .children(self.render_server_panel(&t, cx)),
             )
+            .into_any_element()
     }
 }
 
@@ -5170,5 +5753,28 @@ mod sparkle_tests {
         // A full lap returns to the start.
         let lap = 2. * (80. + 30.) + 4. * arc;
         assert!(near(point_on_rounded_rect(b, r, lap + 5.), (15., 0.)));
+    }
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::move_item;
+
+    #[test]
+    fn moves_down_after_and_up_before_the_target() {
+        let mut v = vec!['a', 'b', 'c', 'd'];
+        assert!(move_item(&mut v, 0, 2));
+        assert_eq!(v, ['b', 'c', 'a', 'd']);
+        assert!(move_item(&mut v, 3, 0));
+        assert_eq!(v, ['d', 'b', 'c', 'a']);
+    }
+
+    #[test]
+    fn ignores_no_op_and_out_of_range_moves() {
+        let mut v = vec![1, 2, 3];
+        assert!(!move_item(&mut v, 1, 1));
+        assert!(!move_item(&mut v, 5, 0));
+        assert!(!move_item(&mut v, 0, 3));
+        assert_eq!(v, [1, 2, 3]);
     }
 }

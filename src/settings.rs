@@ -208,13 +208,13 @@ mod tests {
     fn folder_prefers_the_saved_login_then_the_remote_owner() {
         let mut s = Settings::default();
         s.git_identities = vec![identity("work"), identity("personal")];
-        let both = FolderLogins { saved: Some("personal".into()), owner: Some("work".into()), web: None };
+        let both = FolderLogins { saved: Some("personal".into()), owner: Some("work".into()), ..Default::default() };
         assert_eq!(s.git_for_folder(&both).unwrap().github_user, "personal");
 
-        let unknown_saved = FolderLogins { saved: Some("someone".into()), owner: Some("work".into()), web: None };
+        let unknown_saved = FolderLogins { saved: Some("someone".into()), owner: Some("work".into()), ..Default::default() };
         assert_eq!(s.git_for_folder(&unknown_saved).unwrap().github_user, "work");
 
-        let neither = FolderLogins { saved: None, owner: Some("someone".into()), web: None };
+        let neither = FolderLogins { saved: None, owner: Some("someone".into()), ..Default::default() };
         assert!(s.git_for_folder(&neither).is_none());
     }
 }
